@@ -59,6 +59,17 @@ CHAT_QUERY_REQUEST = re.compile(
     r"^\s*看|查|搜|检索|看看|看一?下|(?:想|要|给我|帮我)看|我要|列出|显示|调出|拉取|"
     r"给我|发(?:我|个|一张|张|一份|份)|多少|第几|什么名次|复盘|统计|图谱|排行榜|资料|帮助|流程图"
 )
+RECORD_NAME = r"[\w·丨]{1,24}"
+RECORD_SERVERS = frozenset({
+    "眉间雪", "山海相逢", "九天", "龙争虎斗", "斗转星移", "乾坤一掷", "剑胆琴心", "绝代天骄",
+    "梦江南", "幽月轮", "长安城", "唯我独尊", "唯满侠", "蝶恋花", "天鹅坪", "破阵子", "飞龙在天",
+    "比赛专用服", "练习专用服",
+})
+BARE_RECORD = re.compile(rf"战绩[ \t]+({RECORD_NAME})[ \t]+({RECORD_NAME})(?:[ \t]+(22|33|55|2v2|3v3|5v5))?", re.IGNORECASE)
+ASK_RECORD = re.compile(
+    rf"(?:请\s*)?(?:(?:帮我|给我)\s*)?(?:查(?:一下|下)?|查询|看看|看一下)\s*"
+    rf"(?:剑(?:网)?[三3]\s*)?({RECORD_NAME})\s*的\s*(?:竞技场\s*)?战绩[。！？!?]?"
+)
 
 
 def chat_key(event: AstrMessageEvent) -> tuple[str, str, str]:
@@ -94,7 +105,22 @@ class PendingNumber(filter.CustomFilter):
         return pending_menu(event) is not None or chat_key(event) in _expired_menus
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.41")
+def direct_record_args(event: AstrMessageEvent) -> list[str] | None:
+    text = event.get_message_str().strip()
+    if match := BARE_RECORD.fullmatch(text):
+        return [value for value in match.groups() if value is not None]
+    if event.is_at_or_wake_command and (match := ASK_RECORD.fullmatch(text)):
+        if match[1].casefold() not in {"我", "你", "他", "她", "它", "ta", "对方", "这个人", "那个人"}:
+            return [match[1]]
+    return None
+
+
+class DirectRecord(filter.CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        return direct_record_args(event) is not None
+
+
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.42")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -327,6 +353,22 @@ class Mingjian(Star):
         text = command[1].strip() if len(command) == 2 else ""
         async for result in self._execute(event, "名剑", [], utterance=text):
             yield result
+
+    @filter.custom_filter(DirectRecord, priority=100)
+    async def direct_record(self, event: AstrMessageEvent):
+        """查询明确的战绩短句，直接复用战绩指令。"""
+        args = direct_record_args(event)
+        if args is None:
+            return
+        if len(args) > 1:
+            server = args[0]
+            if server not in RECORD_SERVERS and alias_key(server) not in self.aliases.servers:
+                return
+        event.stop_event()
+        async for response in self._execute(event, "战绩", args):
+            timing = event.get_extra(TIMING_KEY)
+            event.set_extra(TIMING_KEY, None)
+            await self._send_timed(event, response, timing)
 
     @filter.llm_tool(name="mingjian_query")
     async def mingjian_query(self, event: AstrMessageEvent, action: str = "", args: list[str] | None = None):

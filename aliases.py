@@ -104,6 +104,8 @@ class NameAliases:
         return resolve(self.hearts, value, "心法")
 
     def server(self, value: str) -> str:
+        if value == "唯满侠" and alias_key(value) not in self.servers:
+            return "唯我独尊"
         return resolve(self.servers, value, "服务器")
 
     def lineup(self, value: str) -> str:
