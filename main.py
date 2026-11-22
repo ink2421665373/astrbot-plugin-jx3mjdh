@@ -67,7 +67,7 @@ RECORD_SERVERS = frozenset({
 })
 BARE_RECORD = re.compile(rf"战绩[ \t]+({RECORD_NAME})[ \t]+({RECORD_NAME})(?:[ \t]+(22|33|55|2v2|3v3|5v5))?", re.IGNORECASE)
 ASK_RECORD = re.compile(
-    rf"(?:请\s*)?(?:(?:帮我|给我)\s*)?(?:查(?:一下|下)?|查询|看看|看一下)\s*"
+    rf"(?:请\s*)?(?:(?:帮我|给我)\s*)?(?:查(?:询)?(?:一下|下)?|看看|看一下)\s*"
     rf"(?:剑(?:网)?[三3]\s*)?({RECORD_NAME})\s*的\s*(?:竞技场\s*)?战绩[。！？!?]?"
 )
 
@@ -120,7 +120,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.42")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.43")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
