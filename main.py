@@ -94,7 +94,7 @@ class PendingNumber(filter.CustomFilter):
         return pending_menu(event) is not None or chat_key(event) in _expired_menus
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.39")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.40")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)

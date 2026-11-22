@@ -7,23 +7,57 @@ from .query import QueryError
 
 ALIAS_SEPARATOR = re.compile(r"[\s,，、;；]+")
 LINEUP_SEPARATOR = re.compile(r"([,，、/|+\-]+)")
-ROLE_NICKNAME_FIELDS = ("nickname", "server", "name")
 MAX_ROLES_PER_NICKNAME = 998  # The shared numbered menu also needs one original-name option.
 
 
-def role_nickname_rows(rows: object) -> list[dict[str, str]]:
+def split_role_nicknames(text: str) -> list[str]:
+    return [name for line in text.splitlines() if (name := line.strip())]
+
+
+def role_nickname_groups(rows: object) -> list[dict]:
     if not isinstance(rows, list):
         return []
-    return [{field: row[field] if isinstance(row.get(field), str) else "" for field in ROLE_NICKNAME_FIELDS}
-            for row in rows if isinstance(row, dict)]
+    groups, legacy = [], {}
+
+    def read_role(row):
+        return {key: row[key] if isinstance(row.get(key), str) else "" for key in ("server", "name")}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if "nicknames" in row or "roles" in row:
+            nicknames = row.get("nicknames")
+            roles = row.get("roles")
+            groups.append({
+                "nicknames": nicknames if isinstance(nicknames, str) else "",
+                "roles": [read_role(role) for role in roles if isinstance(role, dict)] if isinstance(roles, list) else [],
+            })
+            continue
+        nickname = row.get("nickname")
+        nickname = nickname.strip() if isinstance(nickname, str) else ""
+        key = alias_key(nickname)
+        if key not in legacy:
+            group = legacy[key] = {"nicknames": nickname, "roles": []}
+            groups.append(group)
+        legacy[key]["roles"].append(read_role(row))
+    return groups
 
 
 def index_role_nicknames(rows: object) -> dict[str, tuple[tuple[str, str], ...]]:
     index: dict[str, dict[tuple[str, str], tuple[str, str]]] = {}
-    for row in role_nickname_rows(rows):
-        nickname, server, name = (row[field].strip() for field in ROLE_NICKNAME_FIELDS)
-        if all(value and value.isprintable() for value in (nickname, server, name)):
-            index.setdefault(alias_key(nickname), {}).setdefault((alias_key(server), alias_key(name)), (server, name))
+    for group in role_nickname_groups(rows):
+        roles = {}
+        for role in group["roles"]:
+            server, name = role["server"].strip(), role["name"].strip()
+            if server and name and server.isprintable() and name.isprintable():
+                roles.setdefault((alias_key(server), alias_key(name)), (server, name))
+        if not roles:
+            continue
+        for nickname in split_role_nicknames(group["nicknames"]):
+            if nickname.isprintable():
+                targets = index.setdefault(alias_key(nickname), {})
+                for identity, role in roles.items():
+                    targets.setdefault(identity, role)
     return {key: tuple(roles.values()) for key, roles in index.items()}
 
 

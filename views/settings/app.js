@@ -17,7 +17,8 @@ const tabs = document.querySelectorAll("[data-tab]");
 const roleSearch = document.getElementById("role-search");
 const roleRows = document.getElementById("role-rows");
 const roleEmpty = document.getElementById("role-empty");
-const roleTemplate = document.getElementById("role-mapping");
+const roleGroupTemplate = document.getElementById("role-group");
+const roleLinkTemplate = document.getElementById("role-link");
 const addRole = document.getElementById("add-role");
 
 const labels = {
@@ -88,19 +89,49 @@ function searchKey(value) {
   return value.normalize("NFKC").trim().toLowerCase();
 }
 
+function showRoleLinks(group, list, addLink) {
+  list.replaceChildren();
+  for (const [index, role] of group.roles.entries()) {
+    const fragment = roleLinkTemplate.content.cloneNode(true);
+    for (const input of fragment.querySelectorAll("input")) {
+      input.value = role[input.name];
+      input.addEventListener("input", () => { role[input.name] = input.value; changed(); });
+    }
+    const remove = fragment.querySelector(".remove-role-link");
+    remove.setAttribute("aria-label", `移除第 ${index + 1} 个角色`);
+    remove.addEventListener("click", () => {
+      group.roles.splice(index, 1);
+      showRoleLinks(group, list, addLink);
+      changed();
+      addLink.focus();
+    });
+    list.append(fragment);
+  }
+}
+
 function showRoleNicknames() {
   const entries = settings.role_nicknames;
   const term = searchKey(roleSearch.value);
   roleRows.replaceChildren();
   for (const [index, entry] of entries.entries()) {
-    if (term && !Object.values(entry).some(value => searchKey(value).includes(term))) continue;
-    const fragment = roleTemplate.content.cloneNode(true);
-    for (const input of fragment.querySelectorAll("input")) {
-      input.value = entry[input.name];
-      input.addEventListener("input", () => { entry[input.name] = input.value; changed(); });
-    }
-    const remove = fragment.querySelector(".remove");
-    remove.setAttribute("aria-label", `移除第 ${index + 1} 条角色昵称关联`);
+    if (term && !searchKey(entry.nicknames).includes(term)
+        && !entry.roles.some(role => [role.name, role.server].some(value => searchKey(value).includes(term)))) continue;
+    const fragment = roleGroupTemplate.content.cloneNode(true);
+    fragment.querySelector("h3").textContent = `第 ${index + 1} 组`;
+    const nicknames = fragment.querySelector("textarea");
+    nicknames.value = entry.nicknames;
+    nicknames.addEventListener("input", () => { entry.nicknames = nicknames.value; changed(); });
+    const links = fragment.querySelector(".role-link-rows");
+    const addLink = fragment.querySelector(".add-role-link");
+    showRoleLinks(entry, links, addLink);
+    addLink.addEventListener("click", () => {
+      entry.roles.push({ server: "", name: "" });
+      showRoleLinks(entry, links, addLink);
+      changed();
+      links.lastElementChild.querySelector("input").focus();
+    });
+    const remove = fragment.querySelector(".remove-role-group");
+    remove.setAttribute("aria-label", `移除第 ${index + 1} 个关联组`);
     remove.addEventListener("click", () => {
       entries.splice(index, 1);
       showRoleNicknames();
@@ -110,7 +141,7 @@ function showRoleNicknames() {
     roleRows.append(fragment);
   }
   roleEmpty.hidden = roleRows.childElementCount !== 0;
-  roleEmpty.textContent = term ? "没有匹配的关联。" : "还没有角色昵称关联。";
+  roleEmpty.textContent = term ? "没有匹配的关联组。" : "还没有角色昵称关联组。";
 }
 
 function setSettings(data) {
@@ -180,10 +211,10 @@ roleSearch.addEventListener("keydown", event => {
 });
 addRole.addEventListener("click", () => {
   roleSearch.value = "";
-  settings.role_nicknames.push({ nickname: "", server: "", name: "" });
+  settings.role_nicknames.push({ nicknames: "", roles: [{ server: "", name: "" }] });
   showRoleNicknames();
   changed();
-  roleRows.lastElementChild.querySelector("input").focus();
+  roleRows.lastElementChild.querySelector("textarea").focus();
 });
 provider.addEventListener("change", () => { settings.natural_language_provider = provider.value; changed(); });
 timeout.addEventListener("input", () => { settings.natural_language_timeout = timeout.valueAsNumber; changed(); });

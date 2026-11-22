@@ -41,9 +41,9 @@
           <section class="panel" aria-labelledby="nickname-title">
             <header class="panel-header">
               <h2 id="nickname-title">角色昵称</h2>
-              <button type="button" id="add-role" class="secondary">添加关联</button>
+              <button type="button" id="add-role" class="secondary">添加关联组</button>
             </header>
-            <p class="hint">一行填一条关联。同一昵称可关联多个角色，同一角色也可使用多个昵称。</p>
+            <p class="hint">每组可填多个昵称和角色。组内每个昵称都能查到这一组的全部角色。</p>
             <label class="field role-search" for="role-search">搜索昵称、区服或角色名
               <input id="role-search" type="search">
             </label>
@@ -91,12 +91,28 @@
         <button type="button" class="remove secondary">移除</button>
       </article>
     </template>
-    <template id="role-mapping">
-      <article class="mapping role-mapping">
-        <label class="field">昵称<input type="text" name="nickname" maxlength="100" placeholder="阿墨"></label>
+    <template id="role-group">
+      <article class="role-group">
+        <header class="role-group-header">
+          <h3></h3>
+          <button type="button" class="remove-role-group secondary">移除整组</button>
+        </header>
+        <div class="role-group-content">
+          <label class="field">昵称（每行一个）
+            <textarea name="nicknames" rows="3" placeholder="阿墨&#10;师父"></textarea>
+          </label>
+          <div class="role-group-links">
+            <div class="role-link-rows"></div>
+            <button type="button" class="add-role-link secondary">添加角色</button>
+          </div>
+        </div>
+      </article>
+    </template>
+    <template id="role-link">
+      <article class="role-link">
         <label class="field">区服<input type="text" name="server" maxlength="100" placeholder="梦江南"></label>
         <label class="field">角色名<input type="text" name="name" maxlength="100" placeholder="云晚归"></label>
-        <button type="button" class="remove secondary">移除</button>
+        <button type="button" class="remove-role-link secondary">移除</button>
       </article>
     </template>
   </main>

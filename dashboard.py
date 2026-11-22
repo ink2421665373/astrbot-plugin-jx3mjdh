@@ -5,8 +5,8 @@ from pathlib import Path
 from astrbot.api import logger
 
 from .aliases import (
-    ALIAS_SEPARATOR, MAX_ROLES_PER_NICKNAME, ROLE_NICKNAME_FIELDS, NameAliases, index_role_nicknames,
-    role_nickname_rows,
+    ALIAS_SEPARATOR, MAX_ROLES_PER_NICKNAME, NameAliases, index_role_nicknames, role_nickname_groups,
+    split_role_nicknames,
 )
 from .labels import alias_key
 from .natural import DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS
@@ -36,7 +36,7 @@ def public_settings(config):
         rows = settings[key]
         settings[key] = [{name: row[name] if isinstance(row.get(name), str) else "" for name in ("target", "aliases")}
                          for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
-    settings["role_nicknames"] = role_nickname_rows(settings["role_nicknames"])
+    settings["role_nicknames"] = role_nickname_groups(settings["role_nicknames"])
     settings["natural_language_enabled"] = settings["natural_language_enabled"] is True
     settings["review_enabled"] = settings["review_enabled"] is True
     for key in ("natural_language_provider", "review_persona"):
@@ -56,34 +56,47 @@ def revision(settings):
 def normalize_role_nicknames(rows, aliases):
     if not isinstance(rows, list):
         raise ValueError("角色昵称须为列表。")
-    links, seen, counts = [], set(), {}
+    groups = []
     for index, row in enumerate(rows, 1):
-        if not isinstance(row, dict) or any(not isinstance(row.get(key), str) for key in ROLE_NICKNAME_FIELDS):
-            raise ValueError(f"请检查角色昵称第 {index} 行。")
-        nickname, server, name = (row[key].strip() for key in ROLE_NICKNAME_FIELDS)
-        if not any((nickname, server, name)):
+        if (not isinstance(row, dict) or not isinstance(row.get("nicknames"), str)
+                or not isinstance(row.get("roles"), list)):
+            raise ValueError(f"请检查角色昵称第 {index} 组。")
+        nicknames = {}
+        for nickname in split_role_nicknames(row["nicknames"]):
+            key = alias_key(nickname)
+            if not nickname.isprintable() or len(nickname) > 100:
+                raise ValueError(f"角色昵称第 {index} 组的每个昵称最多 100 字。")
+            try:
+                tokens, _ = parse_history([key], review=True)
+            except QueryError:
+                tokens = []
+            if not tokens or key in MODES:
+                raise ValueError(f"角色昵称第 {index} 组的「{nickname}」与查询参数重名，请换一个昵称。")
+            nicknames.setdefault(key, nickname)
+
+        roles = {}
+        for number, role in enumerate(row["roles"], 1):
+            if not isinstance(role, dict) or any(not isinstance(role.get(key), str) for key in ("server", "name")):
+                raise ValueError(f"请检查角色昵称第 {index} 组的第 {number} 个角色。")
+            server, name = role["server"].strip(), role["name"].strip()
+            if not server and not name:
+                continue
+            if not all(value and value.isprintable() and len(value) <= 100 for value in (server, name)):
+                raise ValueError(f"角色昵称第 {index} 组的第 {number} 个角色须填写区服和角色名，每项最多 100 字。")
+            server = aliases.server(server)
+            if alias_key(server) in {"全部服务器", "全服搜索"}:
+                raise ValueError(f"角色昵称第 {index} 组的第 {number} 个角色须指定所在区服。")
+            roles.setdefault((alias_key(server), alias_key(name)),
+                             {"__template_key": "role", "server": server, "name": name})
+        if not nicknames and not roles:
             continue
-        if not all(value and value.isprintable() and len(value) <= 100 for value in (nickname, server, name)):
-            raise ValueError(f"角色昵称第 {index} 行须填写昵称、区服和角色名，每项最多 100 字。")
-        key = alias_key(nickname)
-        try:
-            tokens, _ = parse_history([key], review=True)
-        except QueryError:
-            tokens = []
-        if not tokens or key in MODES:
-            raise ValueError(f"角色昵称第 {index} 行的昵称与查询参数重名，请换一个昵称。")
-        server = aliases.server(server)
-        if alias_key(server) in {"全部服务器", "全服搜索"}:
-            raise ValueError(f"角色昵称第 {index} 行须指定角色所在的区服。")
-        identity = (key, alias_key(server), alias_key(name))
-        if identity in seen:
-            raise ValueError(f"角色昵称第 {index} 行与前面的关联重复。")
-        seen.add(identity)
-        counts[key] = counts.get(key, 0) + 1
-        if counts[key] > MAX_ROLES_PER_NICKNAME:
-            raise ValueError(f"单个昵称最多关联 {MAX_ROLES_PER_NICKNAME} 个角色。")
-        links.append({"__template_key": "link", "nickname": nickname, "server": server, "name": name})
-    return links
+        if not nicknames or not roles:
+            raise ValueError(f"角色昵称第 {index} 组须至少填写一个昵称和一个完整角色。")
+        groups.append({"__template_key": "group", "nicknames": "\n".join(nicknames.values()),
+                       "roles": list(roles.values())})
+    if any(len(roles) > MAX_ROLES_PER_NICKNAME for roles in index_role_nicknames(groups).values()):
+        raise ValueError(f"单个昵称最多关联 {MAX_ROLES_PER_NICKNAME} 个角色。")
+    return groups
 
 
 def normalize_settings(value, current, providers, personas):

@@ -35,11 +35,33 @@
   "role_nicknames": {
     "type": "template_list",
     "description": "角色昵称",
-    "hint": "每条关联填写昵称、区服和角色名。一个昵称可关联多个角色，一个角色也可使用多个昵称。",
+    "hint": "每组可填写多个昵称和多个角色。组内每个昵称都对应这一组的全部角色。",
     "default": [],
     "templates": {
+      "group": {
+        "name": "昵称与角色组",
+        "display_item": "nicknames",
+        "items": {
+          "nicknames": {"type": "text", "description": "昵称（每行一个）", "default": ""},
+          "roles": {
+            "type": "template_list",
+            "description": "角色",
+            "default": [],
+            "templates": {
+              "role": {
+                "name": "区服与角色",
+                "display_item": "name",
+                "items": {
+                  "server": {"type": "string", "description": "区服", "default": ""},
+                  "name": {"type": "string", "description": "角色名", "default": ""}
+                }
+              }
+            }
+          }
+        }
+      },
       "link": {
-        "name": "昵称与角色关联",
+        "name": "旧版单条关联",
         "display_item": "nickname",
         "items": {
           "nickname": {"type": "string", "description": "昵称", "default": ""},
