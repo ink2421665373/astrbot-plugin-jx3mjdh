@@ -1,0 +1,106 @@
+{
+  "natural_language_enabled": {
+    "type": "bool",
+    "description": "自然语言查询",
+    "hint": "开启后发送 /名剑 查梦江南的花间游排行。查询句子会交给所选模型识别。",
+    "default": false
+  },
+  "natural_language_provider": {
+    "type": "string",
+    "description": "自然语言模型",
+    "_special": "select_provider",
+    "hint": "自然语言查询和 AI 锐评共用的对话模型。留空跟随当前会话模型。",
+    "default": ""
+  },
+  "natural_language_timeout": {
+    "type": "int",
+    "description": "AI 响应超时（秒）",
+    "hint": "自然语言查询和 AI 锐评等待模型的最长时间，填写 1–300 秒，默认 30 秒。",
+    "obvious_hint": true,
+    "default": 30
+  },
+  "review_enabled": {
+    "type": "bool",
+    "description": "AI 锐评",
+    "hint": "开启后，在战绩、对局、回放、复盘或角色总览下回复 AI 锐评的序号。",
+    "default": false
+  },
+  "review_persona": {
+    "type": "string",
+    "description": "锐评人格",
+    "_special": "select_persona",
+    "hint": "选择 AstrBot 已保存的人格，使用其提示词决定锐评语气。",
+    "default": ""
+  },
+  "role_nicknames": {
+    "type": "template_list",
+    "description": "角色昵称",
+    "hint": "每条关联填写昵称、区服和角色名。一个昵称可关联多个角色，一个角色也可使用多个昵称。",
+    "default": [],
+    "templates": {
+      "link": {
+        "name": "昵称与角色关联",
+        "display_item": "nickname",
+        "items": {
+          "nickname": {"type": "string", "description": "昵称", "default": ""},
+          "server": {"type": "string", "description": "区服", "default": ""},
+          "name": {"type": "string", "description": "角色名", "default": ""}
+        }
+      }
+    }
+  },
+  "heart_aliases": {
+    "type": "template_list",
+    "description": "心法别名",
+    "hint": "为同一个心法添加一个或多个叫法，可用于排行、奇穴、门派资料和配置查询。",
+    "obvious_hint": true,
+    "default": [],
+    "templates": {
+      "rule": {
+        "name": "心法映射",
+        "display_item": "target",
+        "items": {
+          "target": {
+            "type": "string",
+            "description": "心法全名",
+            "hint": "填写原站心法全名，例如花间游或离经易道。",
+            "default": ""
+          },
+          "aliases": {
+            "type": "text",
+            "description": "别名",
+            "hint": "用换行、空格或逗号分隔，例如花花，万花DPS。每个别名只能指向一个心法。",
+            "default": ""
+          }
+        }
+      }
+    }
+  },
+  "server_aliases": {
+    "type": "template_list",
+    "description": "服务器别名",
+    "hint": "为同一个服务器添加一个或多个叫法，可用于排行和角色查询。",
+    "obvious_hint": true,
+    "default": [],
+    "templates": {
+      "rule": {
+        "name": "服务器映射",
+        "display_item": "target",
+        "items": {
+          "target": {
+            "type": "string",
+            "description": "原站服务器名",
+            "hint": "填写原站服务器名，例如梦江南。",
+            "default": ""
+          },
+          "aliases": {
+            "type": "text",
+            "description": "别名",
+            "hint": "用换行、空格或逗号分隔，例如梦服，江南。每个别名只能指向一个服务器。",
+            "default": ""
+          }
+        }
+      }
+    }
+  }
+}

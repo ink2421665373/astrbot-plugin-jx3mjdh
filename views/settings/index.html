@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>名剑查询</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <div>
+        <h1>名剑查询</h1>
+        <p>管理查询别名、角色昵称、对话模型和锐评人格。</p>
+      </div>
+      <div class="actions">
+        <button id="reload" type="button" class="secondary">重新载入</button>
+        <button id="save" type="submit" form="settings" disabled>保存设置</button>
+      </div>
+    </header>
+    <p id="status" class="status" role="status" aria-live="polite">正在读取设置…</p>
+
+    <form id="settings">
+      <fieldset id="fields" class="layout" disabled>
+        <div class="settings-stack">
+          <section class="panel alias-panel" aria-labelledby="alias-title">
+            <header class="panel-header">
+              <h2 id="alias-title">别名映射</h2>
+              <button type="button" id="add" class="secondary">添加映射</button>
+            </header>
+            <div class="tabs" aria-label="别名类别">
+              <button type="button" data-tab="heart_aliases" aria-pressed="true">心法别名 <span id="heart-count">0</span></button>
+              <button type="button" data-tab="server_aliases" aria-pressed="false">服务器别名 <span id="server-count">0</span></button>
+            </div>
+            <p class="hint">同一个名称可添加多个别名，用换行、空格或逗号分开。</p>
+            <div id="rows" class="rows"></div>
+            <p id="empty" class="empty" hidden></p>
+          </section>
+
+          <section class="panel" aria-labelledby="nickname-title">
+            <header class="panel-header">
+              <h2 id="nickname-title">角色昵称</h2>
+              <button type="button" id="add-role" class="secondary">添加关联</button>
+            </header>
+            <p class="hint">一行填一条关联。同一昵称可关联多个角色，同一角色也可使用多个昵称。</p>
+            <label class="field role-search" for="role-search">搜索昵称、区服或角色名
+              <input id="role-search" type="search">
+            </label>
+            <div id="role-rows" class="rows"></div>
+            <p id="role-empty" class="empty" hidden></p>
+          </section>
+        </div>
+
+        <div class="settings-stack">
+          <section class="panel model-panel" aria-labelledby="model-title">
+            <header class="panel-header"><h2 id="model-title">模型设置</h2></header>
+            <label class="check">
+              <input id="enabled" type="checkbox">
+              <span>启用自然语言查询</span>
+            </label>
+            <label class="field" for="provider">对话模型
+              <select id="provider" aria-describedby="provider-hint"></select>
+            </label>
+            <p id="provider-hint" class="hint">自然语言和锐评共用，留空使用当前会话的模型。</p>
+            <label class="field" for="timeout">AI 响应超时（秒）
+              <input id="timeout" type="number" min="1" max="300" step="1" required inputmode="numeric">
+            </label>
+            <p class="hint">可填写 1–300 秒，默认 30 秒。</p>
+          </section>
+
+          <section class="panel model-panel" aria-labelledby="review-title">
+            <header class="panel-header"><h2 id="review-title">AI 锐评</h2></header>
+            <label class="check">
+              <input id="review-enabled" type="checkbox">
+              <span>启用 AI 锐评</span>
+            </label>
+            <label class="field" for="persona">锐评人格
+              <select id="persona" aria-describedby="persona-hint"></select>
+            </label>
+            <p id="persona-hint" class="hint">从 AstrBot 已保存的人格中选择。查到战绩或复盘后，回复锐评序号才会把图卡数据交给模型。</p>
+          </section>
+        </div>
+      </fieldset>
+    </form>
+
+    <template id="mapping">
+      <article class="mapping">
+        <label class="field"><span class="target-label"></span><input class="target" type="text"></label>
+        <label class="field">别名<textarea class="aliases" rows="2"></textarea></label>
+        <button type="button" class="remove secondary">移除</button>
+      </article>
+    </template>
+    <template id="role-mapping">
+      <article class="mapping role-mapping">
+        <label class="field">昵称<input type="text" name="nickname" maxlength="100" placeholder="阿墨"></label>
+        <label class="field">区服<input type="text" name="server" maxlength="100" placeholder="梦江南"></label>
+        <label class="field">角色名<input type="text" name="name" maxlength="100" placeholder="云晚归"></label>
+        <button type="button" class="remove secondary">移除</button>
+      </article>
+    </template>
+  </main>
+</body>
+</html>
