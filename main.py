@@ -66,9 +66,13 @@ RECORD_SERVERS = frozenset({
     "比赛专用服", "练习专用服",
 })
 BARE_RECORD = re.compile(rf"战绩[ \t]+({RECORD_NAME})[ \t]+({RECORD_NAME})(?:[ \t]+(22|33|55|2v2|3v3|5v5))?", re.IGNORECASE)
+QUERY_VERB = r"(?:请\s*)?(?:(?:帮我|给我)\s*)?(?:查(?:询)?(?:一下|下)?|看看|看一下)\s*"
 ASK_RECORD = re.compile(
-    rf"(?:请\s*)?(?:(?:帮我|给我)\s*)?(?:查(?:询)?(?:一下|下)?|看看|看一下)\s*"
-    rf"(?:剑(?:网)?[三3]\s*)?({RECORD_NAME})\s*的\s*(?:竞技场\s*)?战绩[。！？!?]?"
+    rf"{QUERY_VERB}(?:剑(?:网)?[三3]\s*)?({RECORD_NAME})\s*的\s*(?:竞技场\s*)?战绩[。！？!?]?"
+)
+ASK_HEALER_STRENGTH = re.compile(
+    rf"{QUERY_VERB}(?:剑(?:网)?[三3]\s*)?(?:奶妈|治疗)\s*(?:的\s*)?"
+    r"(?:心法\s*)?强度\s*(?:排行(?:榜)?|榜单?)?[。！？!?]?"
 )
 
 
@@ -105,22 +109,26 @@ class PendingNumber(filter.CustomFilter):
         return pending_menu(event) is not None or chat_key(event) in _expired_menus
 
 
-def direct_record_args(event: AstrMessageEvent) -> list[str] | None:
+def direct_chat_query(event: AstrMessageEvent) -> tuple[str, list[str]] | None:
     text = event.get_message_str().strip()
     if match := BARE_RECORD.fullmatch(text):
-        return [value for value in match.groups() if value is not None]
-    if event.is_at_or_wake_command and (match := ASK_RECORD.fullmatch(text)):
+        return "战绩", [value for value in match.groups() if value is not None]
+    if not event.is_at_or_wake_command:
+        return None
+    if match := ASK_RECORD.fullmatch(text):
         if match[1].casefold() not in {"我", "你", "他", "她", "它", "ta", "对方", "这个人", "那个人"}:
-            return [match[1]]
+            return "战绩", [match[1]]
+    if ASK_HEALER_STRENGTH.fullmatch(text):
+        return "强度", ["治疗"]
     return None
 
 
-class DirectRecord(filter.CustomFilter):
+class DirectChatQuery(filter.CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
-        return direct_record_args(event) is not None
+        return direct_chat_query(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.43")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.44")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -354,18 +362,19 @@ class Mingjian(Star):
         async for result in self._execute(event, "名剑", [], utterance=text):
             yield result
 
-    @filter.custom_filter(DirectRecord, priority=100)
-    async def direct_record(self, event: AstrMessageEvent):
-        """查询明确的战绩短句，直接复用战绩指令。"""
-        args = direct_record_args(event)
-        if args is None:
+    @filter.custom_filter(DirectChatQuery, priority=100)
+    async def handle_direct_chat_query(self, event: AstrMessageEvent):
+        """将已明确匹配的聊天短句交给原有查询。"""
+        query = direct_chat_query(event)
+        if query is None:
             return
-        if len(args) > 1:
+        action, args = query
+        if action == "战绩" and len(args) > 1:
             server = args[0]
             if server not in RECORD_SERVERS and alias_key(server) not in self.aliases.servers:
                 return
         event.stop_event()
-        async for response in self._execute(event, "战绩", args):
+        async for response in self._execute(event, action, args):
             timing = event.get_extra(TIMING_KEY)
             event.set_extra(TIMING_KEY, None)
             await self._send_timed(event, response, timing)
