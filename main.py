@@ -9,6 +9,7 @@ from unicodedata import normalize
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api import message_components as components
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .ai_review import REVIEW_ACTION, REVIEW_REPORTS, review_data
@@ -70,9 +71,10 @@ QUERY_VERB = r"(?:请\s*)?(?:(?:帮我|给我)\s*)?(?:查(?:询)?(?:一下|下)?
 ASK_RECORD = re.compile(
     rf"{QUERY_VERB}(?:剑(?:网)?[三3]\s*)?({RECORD_NAME})\s*的\s*(?:竞技场\s*)?战绩[。！？!?]?"
 )
-ASK_HEALER_STRENGTH = re.compile(
-    rf"{QUERY_VERB}(?:剑(?:网)?[三3]\s*)?(?:奶妈|治疗)\s*(?:的\s*)?"
-    r"(?:心法\s*)?强度\s*(?:排行(?:榜)?|榜单?)?[。！？!?]?"
+HEALER_STRENGTH_TOPIC = re.compile(r"(?:奶妈|治疗).*强度|强度.*(?:奶妈|治疗)")
+HEALER_STRENGTH_TOOL_HINT = (
+    "用户明确要查询奶妈或治疗心法的强度榜时，请调用 mingjian_query。"
+    "把强度榜与玩家排行榜区分开：前者 action 填强度，args 加入治疗；只保留用户明确给出的其他筛选。"
 )
 
 
@@ -109,26 +111,24 @@ class PendingNumber(filter.CustomFilter):
         return pending_menu(event) is not None or chat_key(event) in _expired_menus
 
 
-def direct_chat_query(event: AstrMessageEvent) -> tuple[str, list[str]] | None:
+def direct_record_args(event: AstrMessageEvent) -> list[str] | None:
     text = event.get_message_str().strip()
     if match := BARE_RECORD.fullmatch(text):
-        return "战绩", [value for value in match.groups() if value is not None]
+        return [value for value in match.groups() if value is not None]
     if not event.is_at_or_wake_command:
         return None
     if match := ASK_RECORD.fullmatch(text):
         if match[1].casefold() not in {"我", "你", "他", "她", "它", "ta", "对方", "这个人", "那个人"}:
-            return "战绩", [match[1]]
-    if ASK_HEALER_STRENGTH.fullmatch(text):
-        return "强度", ["治疗"]
+            return [match[1]]
     return None
 
 
-class DirectChatQuery(filter.CustomFilter):
+class DirectRecord(filter.CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
-        return direct_chat_query(event) is not None
+        return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.44")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.45")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -362,28 +362,36 @@ class Mingjian(Star):
         async for result in self._execute(event, "名剑", [], utterance=text):
             yield result
 
-    @filter.custom_filter(DirectChatQuery, priority=100)
-    async def handle_direct_chat_query(self, event: AstrMessageEvent):
-        """将已明确匹配的聊天短句交给原有查询。"""
-        query = direct_chat_query(event)
-        if query is None:
+    @filter.custom_filter(DirectRecord, priority=100)
+    async def direct_record(self, event: AstrMessageEvent):
+        """查询明确的战绩短句，直接复用战绩指令。"""
+        args = direct_record_args(event)
+        if args is None:
             return
-        action, args = query
-        if action == "战绩" and len(args) > 1:
+        if len(args) > 1:
             server = args[0]
             if server not in RECORD_SERVERS and alias_key(server) not in self.aliases.servers:
                 return
         event.stop_event()
-        async for response in self._execute(event, action, args):
+        async for response in self._execute(event, "战绩", args):
             timing = event.get_extra(TIMING_KEY)
             event.set_extra(TIMING_KEY, None)
             await self._send_timed(event, response, timing)
+
+    @filter.on_llm_request()
+    async def guide_healer_strength_query(self, event: AstrMessageEvent, request: ProviderRequest):
+        """为模型补充治疗强度的工具用法。"""
+        tool = request.func_tool.get_tool("mingjian_query") if request.func_tool else None
+        text = event.get_message_str().lstrip()
+        if tool and tool.active and HEALER_STRENGTH_TOPIC.search(text) and re.match(QUERY_VERB, text):
+            request.system_prompt += "\n\n" + HEALER_STRENGTH_TOOL_HINT
 
     @filter.llm_tool(name="mingjian_query")
     async def mingjian_query(self, event: AstrMessageEvent, action: str = "", args: list[str] | None = None):
         """发送剑网三名剑大会的数据图卡。仅在用户明确要查战绩、排行、强度统计、奇穴图谱等公开数据时调用，每条消息最多一次。
 
         日常聊天、打法建议或模糊评价走原生对话。例如「花间游怎么打苍云」不调用。「花间游最近强吗」先确认要数据还是打法。
+        奶妈或治疗心法的强度榜是强度统计。对「查一下奶妈的心法强度排行」调用 action="强度"、args=["治疗"]。如果明确说 2200 分以上，参数填 "2200+"。普通玩家名次榜才用排行。
         查战绩时必须有角色名、角色昵称或推栏数字 ID，区服可省略。照抄用户输入的昵称，由插件显示候选。用户没说明的筛选省略，禁止猜测角色、服务器或条件。
         查单场详情、回放或需要评价一场比赛时，先查角色战绩，然后由用户回复编号。图卡与菜单由插件直接发送。
 

@@ -23,7 +23,7 @@ from .labels import SITE
 from .query import QueryError
 
 
-USER_AGENT = "AstrBot-Mingjian/0.2.44"
+USER_AGENT = "AstrBot-Mingjian/0.2.45"
 MAX_JSON_BYTES = 12 * 1024 * 1024
 REQUEST_GAP = 2
 DEFAULT_COOLDOWN = 60
