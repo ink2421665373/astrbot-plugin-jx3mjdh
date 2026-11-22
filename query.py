@@ -310,7 +310,7 @@ def parse_strength(args: list[str]) -> Strength:
             key, value = "period", arg
         elif arg in {"组排", "单排", "全部"}:
             key, value = "queue", arg
-        elif arg in {"输出", "治疗", "DPS", "奶妈"}:
+        elif arg in {"输出", "治疗", "奶妈"} or arg.casefold() == "dps":
             key = "role_type"
             value = "治疗" if arg in {"治疗", "奶妈"} else "输出"
         elif re.fullmatch(r"[0-9]{3,4}[+＋]", arg):

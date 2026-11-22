@@ -71,10 +71,16 @@ QUERY_VERB = r"(?:请\s*)?(?:(?:帮我|给我)\s*)?(?:查(?:询)?(?:一下|下)?
 ASK_RECORD = re.compile(
     rf"{QUERY_VERB}(?:剑(?:网)?[三3]\s*)?({RECORD_NAME})\s*的\s*(?:竞技场\s*)?战绩[。！？!?]?"
 )
-HEALER_STRENGTH_TOPIC = re.compile(r"(?:奶妈|治疗).*强度|强度.*(?:奶妈|治疗)")
-HEALER_STRENGTH_TOOL_HINT = (
-    "用户明确要查询奶妈或治疗心法的强度榜时，请调用 mingjian_query。"
-    "把强度榜与玩家排行榜区分开：前者 action 填强度，args 加入治疗；只保留用户明确给出的其他筛选。"
+STRENGTH_ROLE = r"(?:奶妈|治疗|输出|(?<![a-z0-9_])dps(?![a-z0-9_]))"
+ROLE_STRENGTH_TOPIC = re.compile(rf"{STRENGTH_ROLE}.*强度|强度.*{STRENGTH_ROLE}", re.IGNORECASE)
+BARE_ROLE_STRENGTH = re.compile(
+    rf"{STRENGTH_ROLE}\s*(?:的\s*)?(?:心法\s*)?强度\s*(?:排行榜?|榜单?)[。！？!?]?",
+    re.IGNORECASE,
+)
+ROLE_STRENGTH_TOOL_HINT = (
+    "用户明确要查询心法强度榜时，请调用 mingjian_query，action 填强度。"
+    "奶妈或治疗的 args 加入治疗；DPS 或输出的 args 加入输出。只保留用户明确给出的其他筛选。"
+    "普通玩家名次榜使用排行。"
 )
 
 
@@ -128,7 +134,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.45")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.46")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -379,12 +385,13 @@ class Mingjian(Star):
             await self._send_timed(event, response, timing)
 
     @filter.on_llm_request()
-    async def guide_healer_strength_query(self, event: AstrMessageEvent, request: ProviderRequest):
-        """为模型补充治疗强度的工具用法。"""
+    async def guide_role_strength_query(self, event: AstrMessageEvent, request: ProviderRequest):
+        """为模型补充输出和治疗强度的工具用法。"""
         tool = request.func_tool.get_tool("mingjian_query") if request.func_tool else None
-        text = event.get_message_str().lstrip()
-        if tool and tool.active and HEALER_STRENGTH_TOPIC.search(text) and re.match(QUERY_VERB, text):
-            request.system_prompt += "\n\n" + HEALER_STRENGTH_TOOL_HINT
+        text = event.get_message_str().strip()
+        if (tool and tool.active and ROLE_STRENGTH_TOPIC.search(text)
+                and (re.match(QUERY_VERB, text) or BARE_ROLE_STRENGTH.fullmatch(text))):
+            request.system_prompt += "\n\n" + ROLE_STRENGTH_TOOL_HINT
 
     @filter.llm_tool(name="mingjian_query")
     async def mingjian_query(self, event: AstrMessageEvent, action: str = "", args: list[str] | None = None):
@@ -392,6 +399,7 @@ class Mingjian(Star):
 
         日常聊天、打法建议或模糊评价走原生对话。例如「花间游怎么打苍云」不调用。「花间游最近强吗」先确认要数据还是打法。
         奶妈或治疗心法的强度榜是强度统计。对「查一下奶妈的心法强度排行」调用 action="强度"、args=["治疗"]。如果明确说 2200 分以上，参数填 "2200+"。普通玩家名次榜才用排行。
+        DPS（也可写 dps）指输出。对「dps强度排行」或「查一下输出心法强度排行」调用 action="强度"、args=["输出"]。
         查战绩时必须有角色名、角色昵称或推栏数字 ID，区服可省略。照抄用户输入的昵称，由插件显示候选。用户没说明的筛选省略，禁止猜测角色、服务器或条件。
         查单场详情、回放或需要评价一场比赛时，先查角色战绩，然后由用户回复编号。图卡与菜单由插件直接发送。
 
@@ -399,8 +407,8 @@ class Mingjian(Star):
             action(string): 只选 战绩、战绩复盘、角色总览、排行、强度、配置总览、对位、环境、配队、分布、每日走势、门派、技能、阵法、奇穴、名剑帮助、名剑流程 中的一项。
             args(array[string]): 每个参数一项，按名剑指令填写。无筛选填空数组。例如「花间游的3v3前100排行」填 ["花间游","33","100"]，「梦江南的云晚归最近5场」填 ["梦江南","云晚归","5场"]。
         """
-        text = event.get_message_str()
-        if not (CHAT_QUERY_TOPIC.search(text) and CHAT_QUERY_REQUEST.search(text)):
+        text = event.get_message_str().strip()
+        if not (CHAT_QUERY_TOPIC.search(text) and (CHAT_QUERY_REQUEST.search(text) or BARE_ROLE_STRENGTH.fullmatch(text))):
             yield "本条消息没有明确请求剑三数据。请继续原生聊天，意图不明确时可以询问用户。"
             return
         if (not isinstance(action, str) or action not in QUERY_ACTIONS or not isinstance(args, list)
