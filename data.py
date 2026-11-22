@@ -4,16 +4,18 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from http.client import IncompleteRead
+from functools import partial
+from http.client import HTTPSConnection, IncompleteRead
 from math import ceil
 from os import fsync
 from pathlib import Path
+from socket import gaierror
 from ssl import SSLCertVerificationError, SSLEOFError
 from tempfile import NamedTemporaryFile
 from time import monotonic, time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, Request, build_opener
 
 from astrbot.api import logger
 
@@ -21,7 +23,7 @@ from .labels import SITE
 from .query import QueryError
 
 
-USER_AGENT = "AstrBot-Mingjian/0.2.40"
+USER_AGENT = "AstrBot-Mingjian/0.2.41"
 MAX_JSON_BYTES = 12 * 1024 * 1024
 REQUEST_GAP = 2
 DEFAULT_COOLDOWN = 60
@@ -36,8 +38,53 @@ MAX_RANK_TAGS_CACHE_BYTES = 256 * 1024
 MATCH_RESPONSES = {"match/detail": "详情", "match/replay": "回放数据"}
 
 
+@dataclass
+class OriginTrace:
+    stage: str = "DNS/TCP连接"
+    peer: str = "-"
+
+
+class TracedHTTPSConnection(HTTPSConnection):
+    def __init__(self, *args, trace: OriginTrace, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trace = trace
+        self._base_create_connection = self._create_connection
+        self._create_connection = self._connect_peer
+
+    def _connect_peer(self, *args, **kwargs):
+        self.trace.stage, self.trace.peer = "DNS/TCP连接", "-"
+        sock = self._base_create_connection(*args, **kwargs)
+        self.trace.peer = sock.getpeername()[0]
+        self.trace.stage = "TLS握手"
+        return sock
+
+    def _tunnel(self):
+        self.trace.stage = "代理隧道"
+        super()._tunnel()
+        self.trace.stage = "TLS握手"
+
+    def connect(self):
+        super().connect()
+        self.trace.stage = "发送HTTP请求"
+
+    def getresponse(self):
+        self.trace.stage = "读取HTTP响应头"
+        return super().getresponse()
+
+
+class TracedHTTPSHandler(HTTPSHandler):
+    def __init__(self, trace: OriginTrace):
+        super().__init__()
+        self.trace = trace
+
+    def https_open(self, request):
+        return self.do_open(partial(TracedHTTPSConnection, trace=self.trace), request)
+
+
 class OriginUnavailable(QueryError):
-    pass
+    def __init__(self, message: str, trace: OriginTrace | None = None):
+        super().__init__(message)
+        self.trace = trace
 
 
 class OriginDisconnected(OriginUnavailable):
@@ -88,11 +135,13 @@ def read_json(url: str, body: bytes | None) -> dict:
     if body is not None:
         headers["Content-Type"] = "application/json"
     request = Request(url, data=body, headers=headers)
+    trace = OriginTrace()
     try:
-        with urlopen(request, timeout=12) as response:
+        with build_opener(TracedHTTPSHandler(trace)).open(request, timeout=12) as response:
             final_url = urlsplit(response.geturl())
             if final_url.scheme != "https" or final_url.hostname != urlsplit(SITE).hostname:
                 raise QueryError("原站数据请求跳转到了其他站点。")
+            trace.stage = "读取HTTP响应体"
             content = response.read(MAX_JSON_BYTES + 1)
             response_headers = getattr(response, "headers", None) or {}
             size = response_headers.get("Content-Length", "").strip()
@@ -113,13 +162,15 @@ def read_json(url: str, body: bytes | None) -> dict:
             raise ApiError(exc.code, details, delay) from None
     except (OSError, IncompleteRead) as exc:
         cause = exc.reason if isinstance(exc, URLError) else exc
+        if isinstance(cause, gaierror):
+            trace.stage = "DNS解析"
         if isinstance(cause, (SSLEOFError, ConnectionResetError, ConnectionAbortedError, IncompleteRead)):
-            raise OriginDisconnected("与原站的连接中途断开，请稍后再试。") from exc
+            raise OriginDisconnected("与原站的连接中途断开，请稍后再试。", trace) from exc
         if isinstance(cause, SSLCertVerificationError):
             raise QueryError("无法校验原站 HTTPS 证书，请检查 AstrBot 所在环境的证书和代理。") from exc
         if isinstance(cause, TimeoutError):
-            raise OriginUnavailable("请求原站超时，请稍后再试。") from exc
-        raise OriginUnavailable("连不上原站数据，请检查 AstrBot 的网络后再试。") from exc
+            raise OriginUnavailable("请求原站超时，请稍后再试。", trace) from exc
+        raise OriginUnavailable("连不上原站数据，请检查 AstrBot 的网络后再试。", trace) from exc
     if len(content) > MAX_JSON_BYTES:
         raise QueryError("原站返回的数据太大，暂时无法出图。")
     try:
@@ -324,8 +375,10 @@ class DataClient:
             if match_id is not None:
                 match_document(result, route, match_id)
         except QueryError as exc:
+            trace = exc.trace if isinstance(exc, OriginUnavailable) else None
+            details = f" 阶段={trace.stage} TCP对端={trace.peer}" if trace else ""
             logger.warning(f"名剑取数失败 接口={route} 尝试={attempt} "
-                           f"耗时={monotonic() - started:.2f}s 类型={error_kind(exc)}")
+                           f"耗时={monotonic() - started:.2f}s 类型={error_kind(exc)}{details}")
             if isinstance(exc, ApiError) and exc.status == 429:
                 delay = max(DEFAULT_COOLDOWN, exc.retry_after)
                 self.limited_until = monotonic() + delay
