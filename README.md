@@ -22,6 +22,8 @@
 2. 已安装的用户在插件列表中打开「名剑查询」的「更换插件源」，选择刚添加的源并保存。首次安装也可以在该源中直接找到名剑查询。
 3. 刷新插件列表。当插件源中的版本高于已安装版本时，WebUI 会显示更新入口。
 
+如果部署机器访问 GitHub Raw 超时，可将源地址填为 `https://cdn.jsdelivr.net/gh/ink2421665373/astrbot-plugin-jx3mjdh@main/plugin-market.json`。CDN 缓存可能让新版本提示晚一些出现。
+
 ## 直接用原生聊天查名剑
 
 插件提供原生工具 `mingjian_query`。使用支持工具调用的 AstrBot 对话模型。若当前人格限制可用工具，在该人格的工具权限中允许 `mingjian_query`。群聊沿用 AstrBot 的唤醒设置。
