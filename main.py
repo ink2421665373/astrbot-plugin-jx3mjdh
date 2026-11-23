@@ -1,7 +1,7 @@
 import asyncio
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
@@ -144,11 +144,20 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.65"
+PLUGIN_VERSION = "0.2.66"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
+LAST_ERROR: dict[tuple[str, str, str], tuple[str, float]] = {}
+ROUTE_CACHE: dict[tuple, tuple[str, tuple[str, ...], float]] = {}
+ROUTE_CACHE_TTL = 300
+CACHE_HITS = 0
 CHINESE_DIGITS = dict(zip("零一二三四五六七八九", range(10)))
+CHINESE_DIGITS["两"] = 2
+CHINESE_UNITS = {"十": 10, "百": 100, "千": 1000}
+DATE_WORDS = {"今天": 0, "昨天": 1, "前天": 2}
+MODE_WORDS = {"三三": "33", "二二": "22", "五五": "55", "三V三": "3v3", "二V二": "2v2", "五V五": "5v5"}
+CACHE_SKIP = re.compile(r"那|换成|改成|呢|继续|下一页|下一个|上一个|第[0-9一二三四五六七八九十]+")
 RECENT_QUERY: dict[tuple[str, str, str], tuple[str, float, tuple[str, ...], str]] = {}
 RECORD_NAME = r"[\w·丨]{1,24}"
 RECORD_SERVERS = frozenset({
@@ -324,21 +333,40 @@ STRENGTH_ARG_FIXES = {
 }
 
 
+def score_number(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    if re.fullmatch(r"[一二三四五六七八九十百千两]+", value):
+        return chinese_number(value)
+    return None
+
+
 def normalize_args(action: str, args: object, text: str) -> list[str] | None:
     """把模型常见的参数写法纠正成插件能解析的形式。"""
     if not isinstance(args, list):
         return None
-    values = [str(value).strip() for value in args if str(value).strip()]
+    values = [MODE_WORDS.get(str(value).strip(), str(value).strip())
+              for value in args if str(value).strip()]
     if action == "环境":
         return retry_args("环境", values, text) or []
     if action == "强度":
         fixed = []
         for value in values:
             value = STRENGTH_ARG_FIXES.get(value, value)
-            if match := re.fullmatch(r"([0-9]{3,4})\s*分?(?:以上|\+)", value):
-                value = match[1] + "+"
-            elif match := re.fullmatch(r"([0-9]{3,4})\s*[-–到]\s*([0-9]{3,4})\s*分?", value):
-                value = f"{match[1]}-{match[2]}"
+            if match := re.fullmatch(r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?(?:以上|\+)", value):
+                number = score_number(match[1])
+                if number:
+                    value = f"{number}+"
+            elif match := re.fullmatch(
+                    r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*[-–到]\s*"
+                    r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?", value):
+                lower, upper = score_number(match[1]), score_number(match[2])
+                if lower and upper:
+                    value = f"{lower}-{upper}"
+            else:
+                number = score_number(value)
+                if number and 1000 <= number <= 4000:
+                    value = f"{number}+"
             if value not in fixed:
                 fixed.append(value)
         return fixed
@@ -347,9 +375,10 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
         for value in values:
             if value in {"名剑", "竞技场", "推栏", "pvp", "PVP", "jjc", "JJC"}:
                 continue
-            if match := re.fullmatch(r"前?([0-9]+)\s*名?", value):
-                if match[1] in RANK_LIMITS:
-                    value = match[1]
+            if match := re.fullmatch(r"前?([0-9]+|[一二三四五六七八九十百千两]+)\s*名?", value):
+                number = score_number(match[1])
+                if number is not None and str(number) in RANK_LIMITS:
+                    value = str(number)
             if value not in fixed:
                 fixed.append(value)
         return fixed
@@ -358,6 +387,9 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
         for value in values:
             if value in {"最近", "近"}:
                 continue
+            if value in DATE_WORDS:
+                value = (datetime.now(CHINA_TIME).date()
+                         - timedelta(days=DATE_WORDS[value])).isoformat()
             for server in sorted(RECORD_SERVERS, key=len, reverse=True):
                 if value.startswith(server) and len(value) > len(server):
                     fixed.extend([server, value[len(server):]])
@@ -398,6 +430,26 @@ def remember_query(event: AstrMessageEvent, text: str, action: str):
     RECENT_QUERY[chat_key(event)] = (text, monotonic(), (action,), hint)
 
 
+def cacheable_route(text: str) -> bool:
+    return (len(text) >= 6 and not CACHE_SKIP.search(text)
+            and bool(QUERY_TOPIC_STRONG.search(text)))
+
+
+def cached_route(event: AstrMessageEvent) -> tuple[str, list[str]] | None:
+    if not event.is_at_or_wake_command:
+        return None
+    text = normalize("NFKC", event.get_message_str().strip())
+    entry = ROUTE_CACHE.get(chat_key(event) + (text,))
+    if not entry or monotonic() - entry[2] > ROUTE_CACHE_TTL:
+        return None
+    return entry[0], list(entry[1])
+
+
+class CachedQuery(filter.CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        return cached_route(event) is not None
+
+
 def query_actions(text: str) -> tuple[str, ...]:
     for pattern, actions in TOPIC_ACTIONS:
         if pattern.search(text):
@@ -423,19 +475,27 @@ def generic_query_actions(text: str) -> tuple[str, ...]:
 def chinese_number(text: str) -> int | None:
     if text in CHINESE_DIGITS:
         return CHINESE_DIGITS[text]
-    if "十" in text:
-        left, _, right = text.partition("十")
-        tens = CHINESE_DIGITS.get(left, 1) if left else 1
-        ones = CHINESE_DIGITS.get(right, 0) if right else 0
-        return tens * 10 + ones
-    return None
+    if match := re.fullmatch(r"([一二三四五六七八九两])千([一二三四五六七八九两])", text):
+        return CHINESE_DIGITS[match[1]] * 1000 + CHINESE_DIGITS[match[2]] * 100
+    total, current = 0, 0
+    for char in text:
+        if char in CHINESE_DIGITS:
+            current = CHINESE_DIGITS[char]
+        elif char in CHINESE_UNITS:
+            total += (current or 1) * CHINESE_UNITS[char]
+            current = 0
+        else:
+            return None
+    return total + current
 
 
 def selection_number(event: AstrMessageEvent) -> int | None:
     text = normalize("NFKC", event.get_message_str().strip())
+    if text in {"返回", "上一级", "上一步", "取消"}:
+        return 0
     if re.fullmatch(r"[0-9]{1,3}", text):
         return int(text)
-    match = re.fullmatch(r"(?:选|第)?\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*(?:个|号|项)?", text)
+    match = re.fullmatch(r"(?:选|第)?\s*([0-9]{1,3}|[一二三四五六七八九十两]{1,3})\s*(?:个|号|项)?", text)
     if not match:
         return None
     value = match[1]
@@ -488,7 +548,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.65")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.66")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -518,25 +578,50 @@ class Mingjian(Star):
         """发送名剑指令从入口到后续菜单的流程长图。"""
         yield await self._guide_result(event, flow_card())
 
+    def _cache_route(self, event: AstrMessageEvent, text: str, action: str, args: list[str]):
+        if not self.natural.route_cache_enabled or not cacheable_route(text):
+            return
+        if action in {"名剑帮助", "名剑流程"}:
+            return
+        ROUTE_CACHE[chat_key(event) + (text,)] = (action, tuple(args), monotonic())
+        while len(ROUTE_CACHE) > 64:
+            ROUTE_CACHE.pop(next(iter(ROUTE_CACHE)))
+
     @filter.command("名剑诊断")
     async def diagnose(self, event: AstrMessageEvent):
         """查看名剑插件的工具、模型和最近一次查询状态。"""
         provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
         stage = LAST_STAGE.get(chat_key(event))
-        stage_text = (f"{stage[0]}（{int(monotonic() - stage[1])} 秒前）"
+        now = monotonic()
+        stage_text = (f"{stage[0]}（{int(now - stage[1])} 秒前）"
                       if stage else "本会话还没有完成查询")
+        error = LAST_ERROR.get(chat_key(event))
+        error_text = f"{error[0]}（{int(now - error[1])} 秒前）" if error else "无"
         tool_text = "未知"
         try:
             toolset = self.context.provider_manager.llm_tools.get_full_tool_set()
             tool_text = "已注册" if toolset.get_tool("mingjian_query") else "未注册"
         except Exception:
             pass
+        if getattr(self.service.client, "limited_until", 0) > now:
+            site_text = "限流中"
+        else:
+            try:
+                await asyncio.wait_for(self.service.client.get("rank/time-tags", ttl=600), 3)
+                site_text = "正常"
+            except asyncio.TimeoutError:
+                site_text = "超时"
+            except Exception as exc:
+                site_text = f"失败（{type(exc).__name__}）"
         yield event.plain_result("\n".join((
             f"名剑查询 v{PLUGIN_VERSION}",
             f"工具：{tool_text}（人格未授权时日志会提示不可用）",
             f"对话模型：{provider or '未配置'}",
             f"自然语言：{'已开启' if self.natural.enabled else '未开启'} · 超时 {self.natural.timeout_seconds}s",
+            f"站点：{site_text}",
+            f"缓存：路由命中 {CACHE_HITS} 次 · 当前 {len(ROUTE_CACHE)} 条",
             f"最近一次：{stage_text}",
+            f"最近错误：{error_text}",
             f"运行统计：模型调用 {QUERY_STATS['tool']} · 补调 {QUERY_STATS['retry']} · "
             f"文本路由 {QUERY_STATS['text']} · 失败 {QUERY_STATS['fail']}",
         )))
@@ -575,6 +660,7 @@ class Mingjian(Star):
             status = "发送调用完成"
         except Exception as exc:
             logger.warning(f"名剑发送结果失败 类型={type(exc).__name__}")
+            LAST_ERROR[chat_key(event)] = (f"发送{type(exc).__name__}", monotonic())
             try:
                 await event.send(event.plain_result("图卡发送失败，请稍后重试。"))
             except Exception as retry_exc:
@@ -767,6 +853,22 @@ class Mingjian(Star):
         if sent:
             remember_query(event, event.get_message_str().strip(), "战绩")
 
+    @filter.custom_filter(CachedQuery, priority=100)
+    async def cached_query(self, event: AstrMessageEvent):
+        """同一会话重复的明确问法直接复用上次成功的路由。"""
+        hit = cached_route(event)
+        if hit is None:
+            return
+        action, args = hit
+        global CACHE_HITS
+        CACHE_HITS += 1
+        LAST_STAGE[chat_key(event)] = ("路由缓存", monotonic())
+        event.stop_event()
+        async for response in self._execute(event, action, args):
+            timing = event.get_extra(TIMING_KEY)
+            event.set_extra(TIMING_KEY, None)
+            await self._send_timed(event, response, timing)
+
     @filter.on_llm_request()
     async def guide_query_tool(self, event: AstrMessageEvent, request: ProviderRequest):
         """为明确的数据查询补充工具用法，并为讨论补一份数据摘要说明。"""
@@ -901,6 +1003,7 @@ class Mingjian(Star):
                     ) if provider else None
             except Exception as exc:
                 logger.warning(f"名剑{label}工具补调失败 类型={type(exc).__name__}")
+                LAST_ERROR[chat_key(event)] = (type(exc).__name__, monotonic())
                 retry = None
         if query_retry_finished(event):
             return
@@ -959,6 +1062,7 @@ class Mingjian(Star):
                 return
         QUERY_STATS["fail"] += 1
         LAST_STAGE[chat_key(event)] = ("查询失败", monotonic())
+        LAST_ERROR[chat_key(event)] = ("模型未完成", monotonic())
         response.result_chain = None
         if actions == ("强度",):
             response.completion_text = (
@@ -989,6 +1093,7 @@ class Mingjian(Star):
                 )
         except Exception as exc:
             logger.warning(f"名剑文本补调失败 类型={type(exc).__name__}")
+            LAST_ERROR[chat_key(event)] = (type(exc).__name__, monotonic())
             return None
         try:
             return parse_model_result(response.completion_text or "")
@@ -1101,8 +1206,10 @@ class Mingjian(Star):
             logger.warning(f"名剑工具没有生成结果 操作={action}")
             QUERY_STATS["fail"] += 1
             LAST_STAGE[chat_key(event)] = ("空结果", monotonic())
+            LAST_ERROR[chat_key(event)] = ("空结果", monotonic())
             await event.send(event.plain_result("没有生成查询结果，请重新发送或发送 /名剑帮助 查看用法。"))
         remember_query(event, text, action)
+        self._cache_route(event, text, action, args)
         # The tool already sent its result. Multi-intent messages may run a second tool call.
         event.clear_result()
         if not event.get_extra("mingjian_multi"):

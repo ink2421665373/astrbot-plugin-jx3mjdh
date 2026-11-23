@@ -190,6 +190,7 @@ class NaturalLanguage:
         self.cooldown = cooldown if type(cooldown) is int and 0 <= cooldown <= 60 else 2
         calls = settings.get("natural_max_calls")
         self.max_calls = calls if type(calls) is int and 1 <= calls <= 3 else 2
+        self.route_cache_enabled = settings.get("natural_route_cache") is not False
 
     async def route(
         self, text: str, origin: str, *, on_start: Callable[[], Awaitable[None]] | None = None,

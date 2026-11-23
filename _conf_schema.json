@@ -43,6 +43,12 @@
     "hint": "同一用户连续查询的最短间隔，填写 0–60 秒，0 表示不限制，默认 2 秒。",
     "default": 2
   },
+  "natural_route_cache": {
+    "type": "bool",
+    "description": "复用上次的查询路由",
+    "hint": "同一会话重复同一句明确查询时，直接复用上次成功的动作和参数，不再等待模型。默认开启。",
+    "default": true
+  },
   "natural_max_calls": {
     "type": "int",
     "description": "单条消息最多查询次数",
