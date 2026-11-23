@@ -16,7 +16,7 @@ from astrbot.core.agent.tool import ToolSet
 
 from .ai_review import REVIEW_ACTION, REVIEW_REPORTS, review_data
 from .aliases import MAX_ROLES_PER_NICKNAME, NameAliases, index_role_nicknames
-from .cards import Card, MenuImage
+from .cards import Card, MenuImage, Sparkline
 from .dashboard import register_settings_page
 from .data import ApiError
 from .flow_content import flow_card
@@ -97,6 +97,12 @@ GENERIC_TOOL_HINT = (
     "可用 action：战绩、战绩复盘、角色总览、排行、强度、配置总览、对位、环境、配队、分布、每日走势、门派、技能、阵法、奇穴。"
     "只保留用户明确给出的参数，不要猜测角色、服务器或筛选条件。"
 )
+DIGEST_TOPICS = frozenset({"强度", "对位", "配队"})
+DIGEST_TOOL_HINT = (
+    "用户在讨论或评价剑网三数据。需要事实依据时调用 mingjian_digest，"
+    "topic 填 强度、对位 或 配队，只取文字摘要，不要调用 mingjian_query 出图。"
+)
+CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 RECORD_NAME = r"[\w·丨]{1,24}"
 RECORD_SERVERS = frozenset({
     "眉间雪", "山海相逢", "九天", "龙争虎斗", "斗转星移", "乾坤一掷", "剑胆琴心", "绝代天骄",
@@ -183,6 +189,43 @@ def chat_only(text: str) -> bool:
     if TALK_ONLY.search(text):
         return True
     return bool(OPINION_TALK.search(text)) and not explicit_request(text)
+
+
+def digest_relevant(text: str) -> bool:
+    """讨论句是否涉及可用摘要的剑三数据话题。"""
+    return bool(QUERY_TOPIC_STRONG.search(text) or CHAT_QUERY_TOPIC.search(text)
+                or any(heart in text for heart in RANK_CHAT_HEARTS))
+
+
+def digest_text(card: Card) -> str:
+    """把数据卡片压成给对话模型看的文字摘要。"""
+    def cell(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, Sparkline):
+            return "走势" if value.counts else ""
+        text = getattr(value, "label", None) or getattr(value, "text", None)
+        return str(text) if text is not None else ""
+
+    lines = [f"【{card.title}】{card.subtitle}".strip()]
+    if card.filters:
+        lines.append("筛选：" + "；".join(f"{name}={cell(value)}" for name, value in card.filters))
+    for table in card.tables[:2]:
+        lines.append(f"{table.title}：")
+        if table.columns:
+            lines.append(" | ".join(cell(value) for value in table.columns))
+        lines.extend(" | ".join(cell(value) for value in row) for row in table.rows[:5])
+    if card.columns and card.rows:
+        lines.append(" | ".join(cell(value) for value in card.columns))
+        lines.extend(" | ".join(cell(value) for value in row) for row in card.rows[:5])
+    for title, items in card.groups[:2]:
+        lines.append(f"{title}：")
+        lines.extend("，".join(f"{key}={cell(value)}" for key, value in item.items())
+                     for item in items[:3])
+    if card.note:
+        lines.append(f"说明：{card.note}")
+    lines.append("（以上为站点公开数据摘要，回答时请说明周期与筛选条件。）")
+    return "\n".join(line for line in lines if line)[:1600]
 
 
 def valid_chat_args(args: object) -> TypeGuard[list[str]]:
@@ -284,7 +327,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.52")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.53")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -532,11 +575,19 @@ class Mingjian(Star):
 
     @filter.on_llm_request()
     async def guide_query_tool(self, event: AstrMessageEvent, request: ProviderRequest):
-        """为明确的数据查询补充工具用法，并在模型漏调时登记一次补选。"""
+        """为明确的数据查询补充工具用法，并为讨论补一份数据摘要说明。"""
         text = normalize("NFKC", event.get_message_str().strip())
-        tool = request.func_tool.get_tool("mingjian_query") if request.func_tool else None
-        if not tool or not tool.active:
-            if CHAT_QUERY_TOPIC.search(text) and not chat_only(text):
+        func_tool = request.func_tool
+        tool = func_tool.get_tool("mingjian_query") if func_tool else None
+        digest = func_tool.get_tool("mingjian_digest") if func_tool else None
+        query_ready = bool(tool and tool.active)
+        digest_ready = bool(digest and digest.active)
+        if chat_only(text):
+            if digest_ready and digest_relevant(text):
+                request.system_prompt += "\n\n" + DIGEST_TOOL_HINT
+            return
+        if not query_ready:
+            if not digest_ready and CHAT_QUERY_TOPIC.search(text):
                 logger.info("名剑工具当前会话不可用，未补充查询说明；请检查人格工具权限、模型工具调用设置和唤醒方式。")
             return
         explicit_query = re.search(QUERY_VERB, text)
@@ -651,6 +702,51 @@ class Mingjian(Star):
             response.completion_text = (
                 f"模型未成功调用名剑{label}工具，没有生成图卡。可以发送 /名剑帮助 查看用法。"
             )
+
+    @filter.llm_tool(name="mingjian_digest")
+    async def mingjian_digest(self, event: AstrMessageEvent, topic: str = "", args: list[str] | None = None):
+        """讨论剑三数据时获取一小段事实摘要，不发送图卡。
+
+        用户用讨论、评价或打法语气问数据时调用，例如「花间游怎么打苍云」「奶花现在强吗」「这版本什么配队好用」。
+        只在需要数字依据时调用；明确的看图请求（例如「发一下强度榜」）改用 mingjian_query。每条消息最多一次。
+
+        Args:
+            topic(string): 只选 强度、对位 或 配队。
+            args(array[string]): 强度填 输出/治疗/组排/单排/2200+ 等；对位填 [我方心法, 敌方心法]；配队填空数组。
+        """
+        text = normalize("NFKC", event.get_message_str().strip())
+        values = args or []
+        if topic not in DIGEST_TOPICS:
+            yield "摘要主题只支持 强度、对位、配队。"
+            return
+        if not valid_chat_args(values):
+            yield "摘要参数无效，请按工具说明填写。"
+            return
+        if not chat_only(text) and explicit_request(text) and QUERY_TOPIC_STRONG.search(text):
+            yield "这条消息是明确的数据查询，请调用 mingjian_query 发送图卡；mingjian_digest 只用于讨论。"
+            return
+        if event.get_extra(CHAT_DIGEST_USED):
+            yield "本条消息已经取过摘要，请直接结合摘要回答。"
+            return
+        event.set_extra(CHAT_DIGEST_USED, True)
+        try:
+            params = await self._query(event, topic, [value.strip() for value in values])
+            if isinstance(params, ChoiceMenu):
+                yield "参数还需要选择，请改为发送对应指令查询。"
+                return
+            card = await self.service.run(topic, params, draw=False)
+        except QueryError as exc:
+            yield f"摘要取数失败：{exc}"
+            return
+        except Exception as exc:
+            logger.warning(f"名剑摘要取数失败 主题={topic} 类型={type(exc).__name__}")
+            yield "摘要取数失败，请稍后再试。"
+            return
+        if not isinstance(card, Card):
+            yield "没有可用的数据摘要。"
+            return
+        event.set_extra(CHAT_TOOL_USED, True)
+        yield digest_text(card)
 
     @filter.llm_tool(name="mingjian_query")
     async def mingjian_query(self, event: AstrMessageEvent, action: str = "", args: list[str] | None = None):
