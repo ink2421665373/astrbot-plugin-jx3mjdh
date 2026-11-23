@@ -97,14 +97,13 @@ GENERIC_ACTIONS = frozenset({
 ENTITY_ACTIONS = frozenset({"技能", "门派", "阵法", "奇穴"})
 GENERIC_TOOL_HINT = (
     "用户在查询剑网三数据，请调用 mingjian_query 并选择对应 action。"
-    "可用 action 与参数示例：战绩 [区服?, 角色名, 模式?, 场数?, 日期?]；"
-    "战绩复盘 [区服?, 角色名, 模式?, 场数?, 日期?]；角色总览 [区服?, 角色名, 模式?]；"
-    "排行 [心法?, 模式?, 范围?]；强度 [输出/治疗, 组排/单排, 2200+?]；"
-    "配置总览 [心法?, Top范围?, 治疗/输出?]；对位 [我方心法, 敌方心法?]；"
-    "环境 [组排/单排?]；配队 []；分布 [模式?, 历周走势/周内每日?]；"
-    "每日走势 [模式?]；门派 [门派或心法]；技能 [门派或心法, 技能名]；"
-    "阵法 [心法]；奇穴 [心法, 第N重?, 套路?]。"
-    "只保留用户明确给出的参数，不要猜测角色、服务器或筛选条件。"
+    "参数示例：战绩 [\"唯我独尊\",\"云晚归\",\"33\"]；战绩复盘 [\"唯我独尊\",\"云晚归\",\"33\",\"10场\"]；"
+    "角色总览 [\"唯我独尊\",\"云晚归\",\"33\"]；排行 [\"花间游\",\"33\",\"100\"]；"
+    "强度 [\"治疗\",\"组排\",\"2200+\"]；配置总览 [\"花间游\",\"Top200\",\"治疗\"]；"
+    "对位 [\"花间游\",\"苍云\"]；环境 [\"组排\"]；配队 []；分布 [\"33\",\"历周走势\"]；"
+    "每日走势 [\"33\",\"花间游\"]；门派 [\"万花\"]；技能 [\"万花\",\"芙蓉并蒂\"]；"
+    "阵法 [\"花间游\"]；奇穴 [\"花间游\"] 或 [\"花间游\",\"第8重\",\"套路=2\"]。"
+    "参数只填值，不要写 心法=、技能= 这类标签；不要猜测角色、服务器或筛选条件。"
 )
 DIGEST_TOPICS = frozenset({"强度", "对位", "配队"})
 ACTION_COMMANDS = {
@@ -144,7 +143,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.66"
+PLUGIN_VERSION = "0.2.67"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -397,6 +396,20 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
             else:
                 fixed.append(value)
         return fixed
+    if action in {"门派", "技能", "奇穴", "阵法"}:
+        fixed = []
+        for value in values:
+            for label in ("心法", "技能"):
+                for sep in ("=", "＝"):
+                    prefix = label + sep
+                    if value.startswith(prefix):
+                        value = value[len(prefix):].strip()
+                        break
+            if value and value not in {action, "心法", "技能"}:
+                fixed.append(value)
+        if len(fixed) >= 2 and alias_key(fixed[0]) == alias_key(fixed[1]):
+            fixed.pop(1)
+        return fixed
     return values
 
 
@@ -548,7 +561,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.66")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.67")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
