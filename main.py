@@ -126,13 +126,25 @@ ACTION_COMMANDS = {
     "名剑帮助": "/名剑帮助",
     "名剑流程": "/名剑流程",
 }
-QUERY_NUDGE = "\n\n（内部提示：这是剑三数据查询，请调用 mingjian_query 工具，不要直接回答。）"
+MULTI_SEPARATOR = re.compile(r"和|以及|还有|顺便|、|,")
+MULTI_TOPICS = ("战绩", "复盘", "角色总览", "排行", "强度", "配置总览", "对位", "环境",
+                "配队", "分布", "每日走势", "门派", "技能", "阵法", "奇穴")
+
+
+def multi_intent(text: str) -> bool:
+    """一条消息里是否明确问了两个不同的数据主题。"""
+    return bool(MULTI_SEPARATOR.search(text)
+                and sum(1 for topic in MULTI_TOPICS if topic in text) >= 2)
+
+
+QUERY_NUDGE = "\n\n（内部提示：这是剑三数据查询，请调用 mingjian_query 工具，不要直接回答。若一次问了两件数据，请分别调用两次。）"
 DIGEST_TOOL_HINT = (
     "用户在讨论或评价剑网三数据。需要事实依据时调用 mingjian_digest，"
     "topic 填 强度、对位 或 配队，只取文字摘要，不要调用 mingjian_query 出图。"
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
-PLUGIN_VERSION = "0.2.64"
+CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
+PLUGIN_VERSION = "0.2.65"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -476,7 +488,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.64")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.65")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -829,6 +841,8 @@ class Mingjian(Star):
                         payload["role_type"] = role
                     event.set_extra(QUERY_RETRY_REQUEST, payload)
         if isinstance(event.get_extra(QUERY_RETRY_REQUEST), dict):
+            if multi_intent(text):
+                event.set_extra("mingjian_multi", True)
             prompt = (request.prompt or "").rstrip()
             if "请调用 mingjian_query" not in prompt:
                 request.prompt = prompt + QUERY_NUDGE
@@ -836,6 +850,11 @@ class Mingjian(Star):
     @filter.on_llm_response()
     async def retry_query_tool(self, event: AstrMessageEvent, response: LLMResponse | None):
         """明确的名剑排行或心法强度请求漏调工具时，让当前模型补选一次。"""
+        if (event.get_extra("mingjian_multi") and event.get_extra(CHAT_TOOL_USED)
+                and response is not None and response.role == "assistant" and not response.tools_call_name):
+            response.result_chain = None
+            response.completion_text = ""
+            return
         retry_request = event.get_extra(QUERY_RETRY_REQUEST)
         if not isinstance(retry_request, dict):
             if (response is not None and response.role == "assistant" and not response.tools_call_name
@@ -1023,7 +1042,7 @@ class Mingjian(Star):
 
     @filter.llm_tool(name="mingjian_query")
     async def mingjian_query(self, event: AstrMessageEvent, action: str = "", args: list[str] | None = None):
-        """发送剑网三名剑大会的数据图卡。仅在用户明确要查战绩、排行、强度统计、奇穴图谱等公开数据时调用，每条消息最多一次。
+        """发送剑网三名剑大会的数据图卡。仅在用户明确要查战绩、排行、强度统计、奇穴图谱等公开数据时调用。用户一条消息里明确问了两件数据时，可以分别调用两次；最多两次。
 
         日常聊天、打法建议或模糊评价走原生对话。例如「花间游怎么打苍云」不调用。「花间游最近强吗」先确认要数据还是打法。
         奶妈或治疗心法的强度榜是强度统计。对「查一下奶妈的心法强度排行」调用 action="强度"、args=["治疗"]。如果明确说 2200 分以上，参数填 "2200+"。普通玩家名次榜才用排行。
@@ -1050,19 +1069,21 @@ class Mingjian(Star):
                 or (action in {"名剑帮助", "名剑流程"} and args)):
             yield "名剑查询参数无效，请按工具说明提供一个受支持的操作和参数数组。"
             return
-        if event.get_extra(CHAT_TOOL_USED):
-            yield "本条消息已经调用过名剑查询。可让用户回复菜单编号或发起下一次查询。"
+        used = int(event.get_extra(CHAT_TOOL_COUNT) or 0)
+        if used >= self.natural.max_calls:
+            yield f"本条消息最多查询 {self.natural.max_calls} 次。可让用户回复菜单编号或发起下一次查询。"
             return
-        event.set_extra(CHAT_TOOL_USED, True)
-        action = correct_guide_action(text, action)
-        args = normalize_args(action, args, text)
         stage = event.get_extra("mingjian_stage") or "模型调用工具"
         now = monotonic()
-        if (stage == "模型调用工具" and self.natural.cooldown
+        if (used == 0 and stage == "模型调用工具" and self.natural.cooldown
                 and now - LAST_QUERY_AT.get(chat_key(event), 0.0) < self.natural.cooldown):
             yield f"查询太频繁，请等 {self.natural.cooldown} 秒后再试。"
             return
         LAST_QUERY_AT[chat_key(event)] = now
+        event.set_extra(CHAT_TOOL_COUNT, used + 1)
+        event.set_extra(CHAT_TOOL_USED, True)
+        action = correct_guide_action(text, action)
+        args = normalize_args(action, args, text)
         LAST_STAGE[chat_key(event)] = (stage, now)
         QUERY_STATS[{"模型调用工具": "tool", "工具补调": "retry", "文本补调": "text"}.get(stage, "tool")] += 1
 
@@ -1082,9 +1103,10 @@ class Mingjian(Star):
             LAST_STAGE[chat_key(event)] = ("空结果", monotonic())
             await event.send(event.plain_result("没有生成查询结果，请重新发送或发送 /名剑帮助 查看用法。"))
         remember_query(event, text, action)
-        # The tool already sent its result. Finish this event without a second AI reply.
+        # The tool already sent its result. Multi-intent messages may run a second tool call.
         event.clear_result()
-        event.stop_event()
+        if not event.get_extra("mingjian_multi"):
+            event.stop_event()
         yield
 
     async def _execute(self, event: AstrMessageEvent, action: str, args: list[str], *, utterance: str | None = None):

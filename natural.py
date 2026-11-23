@@ -188,6 +188,8 @@ class NaturalLanguage:
         self.retry_timeout = retry if type(retry) is int and 1 <= retry <= 60 else 10
         cooldown = settings.get("natural_cooldown")
         self.cooldown = cooldown if type(cooldown) is int and 0 <= cooldown <= 60 else 2
+        calls = settings.get("natural_max_calls")
+        self.max_calls = calls if type(calls) is int and 1 <= calls <= 3 else 2
 
     async def route(
         self, text: str, origin: str, *, on_start: Callable[[], Awaitable[None]] | None = None,
