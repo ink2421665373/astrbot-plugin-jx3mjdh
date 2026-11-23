@@ -120,14 +120,6 @@ BARE_ROLE_STRENGTH = re.compile(
     rf"{STRENGTH_ROLE}\s*(?:的\s*)?(?:心法\s*)?强度\s*(?:排行榜?|榜单?)?[。！？!?]?",
     re.IGNORECASE,
 )
-SIMPLE_ROLE_STRENGTH = re.compile(
-    rf"^\s*(?:请问|麻烦|能|可以|我想|想|要)?\s*(?:帮我|给我)?\s*(?:请)?\s*"
-    rf"(?:查(?:询)?(?:一下|下)?|看看|看一下|瞧一瞧)?\s*"
-    rf"(?P<role>奶妈|治疗|输出|dps)\s*(?:的\s*)?(?:心法\s*)?"
-    rf"强度\s*(?:排行榜?|榜单?)?\s*[，,。.！!？?~～…]*\s*"
-    rf"(?:谢谢|多谢|感谢|啦|呀|啊|哦|哈|嘛|呢|吗)?[，,。.！!？?~～…]*\s*$",
-    re.IGNORECASE,
-)
 ROLE_STRENGTH_TOOL_HINT = (
     "用户明确要查询心法强度榜时，请调用 mingjian_query，action 填强度。"
     "奶妈或治疗的 args 加入治疗；DPS 或输出的 args 加入输出。只保留用户明确给出的其他筛选。"
@@ -169,13 +161,11 @@ def query_retry_finished(event: AstrMessageEvent) -> bool:
             or bool(event.get_extra("agent_user_aborted")) or bool(event.get_extra("agent_stop_requested")))
 
 
-def simple_role_strength_arg(text: str) -> str | None:
+def strength_role(text: str) -> str | None:
+    """返回强度问句里唯一的角色类型，出现两种角色时不猜。"""
     roles = set()
-    for part in re.split(r"[，,。;；!?！？~～…\n]+", normalize("NFKC", text)):
-        match = SIMPLE_ROLE_STRENGTH.fullmatch(part)
-        if not match:
-            continue
-        role = match.group("role").casefold()
+    for match in re.finditer(STRENGTH_ROLE, text, re.IGNORECASE):
+        role = match.group(0).casefold()
         roles.add("治疗" if role in {"奶妈", "治疗"} else "输出")
     return roles.pop() if len(roles) == 1 else None
 
@@ -337,8 +327,13 @@ def direct_record_args(event: AstrMessageEvent) -> list[str] | None:
     if not event.is_at_or_wake_command:
         return None
     if match := ASK_RECORD.fullmatch(text):
-        if match[1].casefold() not in {"我", "你", "他", "她", "它", "ta", "对方", "这个人", "那个人"}:
-            return [match[1]]
+        name = match[1]
+        if name.casefold() in {"我", "你", "他", "她", "它", "ta", "对方", "这个人", "那个人"}:
+            return None
+        for server in sorted(RECORD_SERVERS, key=len, reverse=True):
+            if name.startswith(server) and len(name) > len(server):
+                return [server, name[len(server):]]
+        return [name]
     return None
 
 
@@ -347,7 +342,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.58")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.59")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -621,7 +616,7 @@ class Mingjian(Star):
                  and not query_retry_finished(event))
         if ROLE_STRENGTH_TOPIC.search(text) and (explicit_query or BARE_ROLE_STRENGTH.fullmatch(text)):
             request.system_prompt += "\n\n" + ROLE_STRENGTH_TOOL_HINT
-            expected_role = simple_role_strength_arg(text)
+            expected_role = strength_role(text)
             if expected_role and ready:
                 event.set_extra(QUERY_RETRY_REQUEST, {
                     "actions": ("强度",),
