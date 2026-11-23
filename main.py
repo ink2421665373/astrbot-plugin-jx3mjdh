@@ -347,7 +347,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.57")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.58")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -409,6 +409,12 @@ class Mingjian(Star):
         try:
             await event.send(result)
             status = "发送调用完成"
+        except Exception as exc:
+            logger.warning(f"名剑发送结果失败 类型={type(exc).__name__}")
+            try:
+                await event.send(event.plain_result("图卡发送失败，请稍后重试。"))
+            except Exception as retry_exc:
+                logger.warning(f"名剑发送失败提示也失败 类型={type(retry_exc).__name__}")
         finally:
             timing.log(event, status)
 
@@ -659,6 +665,12 @@ class Mingjian(Star):
         """明确的名剑排行或心法强度请求漏调工具时，让当前模型补选一次。"""
         retry_request = event.get_extra(QUERY_RETRY_REQUEST)
         if not isinstance(retry_request, dict):
+            if (response is not None and response.role == "assistant" and not response.tools_call_name
+                    and not response.result_chain and not (response.completion_text or "").strip()):
+                text = normalize("NFKC", event.get_message_str().strip())
+                if CHAT_QUERY_TOPIC.search(text) and not chat_only(text):
+                    logger.info("名剑数据查询返回空回复，补充提示。")
+                    response.completion_text = "本次没有生成查询结果，可以发送 /剑三 或 /名剑帮助 重新查询。"
             return
         if query_retry_finished(event):
             event.set_extra(QUERY_RETRY_REQUEST, None)
@@ -799,6 +811,7 @@ class Mingjian(Star):
             args(array[string]): 每个参数一项，按名剑指令填写。无筛选填空数组。例如「花间游的3v3前100排行」填 ["花间游","33","100"]，「梦江南的云晚归最近5场」填 ["梦江南","云晚归","5场"]。
         """
         text = normalize("NFKC", event.get_message_str().strip())
+        logger.info(f"名剑工具调用 操作={action} 参数={args}")
         if chat_only(text):
             yield "这条消息更像打法或评价讨论，请继续原生聊天；需要数据时再调用工具。"
             return
@@ -827,6 +840,9 @@ class Mingjian(Star):
             timing = event.get_extra(TIMING_KEY)
             event.set_extra(TIMING_KEY, None)
             await self._send_timed(event, result, timing)
+        elif not event.is_stopped():
+            logger.warning(f"名剑工具没有生成结果 操作={action}")
+            await event.send(event.plain_result("没有生成查询结果，请重新发送或发送 /名剑帮助 查看用法。"))
         # The tool already sent its result. Finish this event without a second AI reply.
         event.clear_result()
         event.stop_event()
@@ -865,6 +881,11 @@ class Mingjian(Star):
             response = await self._reply(event, state, action, params, timing, show_progress=utterance is None)
             if response is not None:
                 yield self._result_ready(event, response, timing)
+            else:
+                logger.warning(f"名剑查询没有生成结果 操作={action}")
+                yield self._result_ready(
+                    event, event.plain_result("本次查询没有生成结果，请重新发送。"), timing,
+                )
         except QueryError as exc:
             if _chats.get(key) is state:
                 if (utterance is not None and action == "名剑" and previous
