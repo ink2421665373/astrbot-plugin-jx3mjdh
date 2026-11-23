@@ -79,12 +79,15 @@ ASK_RECORD = re.compile(
 STRENGTH_ROLE = r"(?:奶妈|治疗|输出|(?<![a-z0-9_])dps(?![a-z0-9_]))"
 ROLE_STRENGTH_TOPIC = re.compile(rf"{STRENGTH_ROLE}.*强度|强度.*{STRENGTH_ROLE}", re.IGNORECASE)
 BARE_ROLE_STRENGTH = re.compile(
-    rf"{STRENGTH_ROLE}\s*(?:的\s*)?(?:心法\s*)?强度\s*(?:排行榜?|榜单?)[。！？!?]?",
+    rf"{STRENGTH_ROLE}\s*(?:的\s*)?(?:心法\s*)?强度\s*(?:排行榜?|榜单?)?[。！？!?]?",
     re.IGNORECASE,
 )
 SIMPLE_ROLE_STRENGTH = re.compile(
-    rf"^\s*(?:{QUERY_VERB})?(?P<role>奶妈|治疗|输出|dps)\s*(?:的\s*)?(?:心法\s*)?"
-    rf"强度\s*(?:排行榜?|榜单?)?[。！？!?]*\s*$",
+    rf"^\s*(?:请问|麻烦|能|可以|我想|想|要)?\s*(?:帮我|给我)?\s*(?:请)?\s*"
+    rf"(?:查(?:询)?(?:一下|下)?|看看|看一下|瞧一瞧)?\s*"
+    rf"(?P<role>奶妈|治疗|输出|dps)\s*(?:的\s*)?(?:心法\s*)?"
+    rf"强度\s*(?:排行榜?|榜单?)?\s*[，,。.！!？?~～…]*\s*"
+    rf"(?:谢谢|多谢|感谢|啦|呀|啊|哦|哈|嘛|呢|吗)?[，,。.！!？?~～…]*\s*$",
     re.IGNORECASE,
 )
 ROLE_STRENGTH_TOOL_HINT = (
@@ -114,7 +117,7 @@ def query_retry_finished(event: AstrMessageEvent) -> bool:
 
 
 def simple_role_strength_arg(text: str) -> str | None:
-    match = SIMPLE_ROLE_STRENGTH.fullmatch(text)
+    match = SIMPLE_ROLE_STRENGTH.fullmatch(normalize("NFKC", text))
     if not match:
         return None
     role = match.group("role").casefold()
@@ -173,7 +176,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.48")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.49")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -425,8 +428,8 @@ class Mingjian(Star):
         tool = request.func_tool.get_tool("mingjian_query") if request.func_tool else None
         if not tool or not tool.active:
             return
-        text = event.get_message_str().strip()
-        explicit_query = re.match(QUERY_VERB, text)
+        text = normalize("NFKC", event.get_message_str().strip())
+        explicit_query = re.search(QUERY_VERB, text)
         if ROLE_STRENGTH_TOPIC.search(text) and (explicit_query or BARE_ROLE_STRENGTH.fullmatch(text)):
             request.system_prompt += "\n\n" + ROLE_STRENGTH_TOOL_HINT
             expected_role = simple_role_strength_arg(text)
