@@ -132,9 +132,11 @@ DIGEST_TOOL_HINT = (
     "topic 填 强度、对位 或 配队，只取文字摘要，不要调用 mingjian_query 出图。"
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
-PLUGIN_VERSION = "0.2.63"
+PLUGIN_VERSION = "0.2.64"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
+LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
+CHINESE_DIGITS = dict(zip("零一二三四五六七八九", range(10)))
 RECENT_QUERY: dict[tuple[str, str, str], tuple[str, float, tuple[str, ...], str]] = {}
 RECORD_NAME = r"[\w·丨]{1,24}"
 RECORD_SERVERS = frozenset({
@@ -406,9 +408,26 @@ def generic_query_actions(text: str) -> tuple[str, ...]:
     return actions if explicit_request(text) or entity or len(re.sub(r"\s+", "", text)) <= 12 else ()
 
 
+def chinese_number(text: str) -> int | None:
+    if text in CHINESE_DIGITS:
+        return CHINESE_DIGITS[text]
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = CHINESE_DIGITS.get(left, 1) if left else 1
+        ones = CHINESE_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return None
+
+
 def selection_number(event: AstrMessageEvent) -> int | None:
     text = normalize("NFKC", event.get_message_str().strip())
-    return int(text) if re.fullmatch(r"[0-9]{1,3}", text) else None
+    if re.fullmatch(r"[0-9]{1,3}", text):
+        return int(text)
+    match = re.fullmatch(r"(?:选|第)?\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\s*(?:个|号|项)?", text)
+    if not match:
+        return None
+    value = match[1]
+    return int(value) if value.isdigit() else chinese_number(value)
 
 
 def expire_menu(key: tuple[str, str, str]):
@@ -457,7 +476,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.63")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.64")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -850,18 +869,20 @@ class Mingjian(Star):
             await self._send_query_progress(event, QueryTiming("补查"), "正在补查…")
         except Exception:
             pass
-        try:
-            async with asyncio.timeout(min(self.natural.timeout_seconds, QUERY_RETRY_TIMEOUT)):
-                provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
-                if query_retry_finished(event):
-                    return
-                retry = await self.context.llm_generate(
-                    chat_provider_id=provider, prompt=route_prompt(event, text), tools=tools,
-                    system_prompt=system, tool_choice="required",
-                ) if provider else None
-        except Exception as exc:
-            logger.warning(f"名剑{label}工具补调失败 类型={type(exc).__name__}")
-            retry = None
+        retry = None
+        if self.natural.retry_enabled:
+            try:
+                async with asyncio.timeout(min(self.natural.timeout_seconds, self.natural.retry_timeout)):
+                    provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+                    if query_retry_finished(event):
+                        return
+                    retry = await self.context.llm_generate(
+                        chat_provider_id=provider, prompt=route_prompt(event, text), tools=tools,
+                        system_prompt=system, tool_choice="required",
+                    ) if provider else None
+            except Exception as exc:
+                logger.warning(f"名剑{label}工具补调失败 类型={type(exc).__name__}")
+                retry = None
         if query_retry_finished(event):
             return
         if (retry and retry.role in {"assistant", "tool"} and retry.tools_call_name == ["mingjian_query"]
@@ -888,7 +909,7 @@ class Mingjian(Star):
                         pass
                     if query_retry_finished(event):
                         return
-        if not query_retry_finished(event):
+        if not query_retry_finished(event) and self.natural.text_route_enabled:
             routed = await self._text_route(event, text)
             if routed is not None and routed[0] in actions:
                 action, route_args = routed
@@ -1036,7 +1057,13 @@ class Mingjian(Star):
         action = correct_guide_action(text, action)
         args = normalize_args(action, args, text)
         stage = event.get_extra("mingjian_stage") or "模型调用工具"
-        LAST_STAGE[chat_key(event)] = (stage, monotonic())
+        now = monotonic()
+        if (stage == "模型调用工具" and self.natural.cooldown
+                and now - LAST_QUERY_AT.get(chat_key(event), 0.0) < self.natural.cooldown):
+            yield f"查询太频繁，请等 {self.natural.cooldown} 秒后再试。"
+            return
+        LAST_QUERY_AT[chat_key(event)] = now
+        LAST_STAGE[chat_key(event)] = (stage, now)
         QUERY_STATS[{"模型调用工具": "tool", "工具补调": "retry", "文本补调": "text"}.get(stage, "tool")] += 1
 
         if action in {"名剑帮助", "名剑流程"}:

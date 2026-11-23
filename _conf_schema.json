@@ -19,6 +19,30 @@
     "obvious_hint": true,
     "default": 30
   },
+  "natural_retry_enabled": {
+    "type": "bool",
+    "description": "模型漏调时补调",
+    "hint": "模型第一次没有调用名剑工具时，再用强制工具调用补一次。关闭后直接走文本路由。",
+    "default": true
+  },
+  "natural_retry_timeout": {
+    "type": "int",
+    "description": "补调等待（秒）",
+    "hint": "补调和文本路由最多等待模型的时间，填写 1–60 秒，默认 10 秒。",
+    "default": 10
+  },
+  "natural_text_route_enabled": {
+    "type": "bool",
+    "description": "文本路由兜底",
+    "hint": "工具补调失败后，让模型用普通文本输出动作和参数再识别一次。",
+    "default": true
+  },
+  "natural_cooldown": {
+    "type": "int",
+    "description": "同一用户查询间隔（秒）",
+    "hint": "同一用户连续查询的最短间隔，填写 0–60 秒，0 表示不限制，默认 2 秒。",
+    "default": 2
+  },
   "review_enabled": {
     "type": "bool",
     "description": "AI 锐评",

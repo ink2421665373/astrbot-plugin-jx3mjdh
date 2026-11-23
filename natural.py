@@ -182,6 +182,12 @@ class NaturalLanguage:
         self.review_enabled = settings.get("review_enabled") is True
         persona = settings.get("review_persona")
         self.review_persona = persona if isinstance(persona, str) else ""
+        self.retry_enabled = settings.get("natural_retry_enabled") is not False
+        self.text_route_enabled = settings.get("natural_text_route_enabled") is not False
+        retry = settings.get("natural_retry_timeout")
+        self.retry_timeout = retry if type(retry) is int and 1 <= retry <= 60 else 10
+        cooldown = settings.get("natural_cooldown")
+        self.cooldown = cooldown if type(cooldown) is int and 0 <= cooldown <= 60 else 2
 
     async def route(
         self, text: str, origin: str, *, on_start: Callable[[], Awaitable[None]] | None = None,
