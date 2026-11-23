@@ -143,14 +143,15 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.68"
-QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
+PLUGIN_VERSION = "0.2.69"
+QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "rule": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
 LAST_ERROR: dict[tuple[str, str, str], tuple[str, float]] = {}
 ROUTE_CACHE: dict[tuple, tuple[str, tuple[str, ...], float]] = {}
 ROUTE_CACHE_TTL = 300
 CACHE_HITS = 0
+CURRENT_ALIASES: NameAliases | None = None
 CHINESE_DIGITS = dict(zip("零一二三四五六七八九", range(10)))
 CHINESE_DIGITS["两"] = 2
 CHINESE_UNITS = {"十": 10, "百": 100, "千": 1000}
@@ -463,6 +464,23 @@ class CachedQuery(filter.CustomFilter):
         return cached_route(event) is not None
 
 
+def direct_query_route(event: AstrMessageEvent) -> tuple[str, list[str]] | None:
+    if (event.get_extra("mingjian_no_direct") or not event.is_at_or_wake_command
+            or CURRENT_ALIASES is None):
+        return None
+    raw = str(getattr(getattr(event, "message_obj", None), "message_str", "") or "")
+    text = normalize("NFKC", event.get_message_str().strip())
+    if (raw.strip().startswith(("/", "／")) or text.startswith(("/", "／"))
+            or chat_only(text) or multi_intent(text)):
+        return None
+    return fallback_route(text, CURRENT_ALIASES)
+
+
+class DirectQuery(filter.CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        return direct_query_route(event) is not None
+
+
 SCHOOL_TOKEN = re.compile(
     r"(?:查|看|帮我|给我)?[一下]*(?:剑(?:网)?[三3])?\s*([\w·丨]{2,8}?)(?:的)?\s*"
     r"(?:门派|资料|阵法|奇穴|技能)")
@@ -482,36 +500,168 @@ def find_hearts(text: str, aliases: NameAliases) -> list[str]:
     return found
 
 
+ROLE_BEFORE = re.compile(r"([\w·丨]{2,24}?)的(?:竞技场)?(?:战绩|复盘|角色总览)")
+ROLE_BEFORE_RECENT = re.compile(r"([\w·丨]{2,24}?)(?:最近|近)\s*[0-9一二三四五六七八九十两]+\s*场")
+ROLE_AFTER = re.compile(r"(?:战绩|复盘|角色总览)\s+([\w·丨]{2,24})(?:\s+([\w·丨]{2,24}))?")
+SKILL_PAIR = re.compile(r"([\w·丨]{2,8})的([\w·丨]{2,12}?)(?:技能|详情)")
+ROLE_PREFIX = re.compile(
+    r"^(?:帮我|给我|请|查一下|查一查|查询|查|看看|看一下|看|复盘|战绩复盘|多场复盘)\s*")
+
+
+def split_role_name(value: str) -> tuple[str, str]:
+    for server in sorted(RECORD_SERVERS, key=len, reverse=True):
+        if value.startswith(server) and len(value) > len(server):
+            return server, value[len(server):]
+    return "", value
+
+
+def find_server(text: str, aliases: NameAliases) -> str:
+    servers = set(RECORD_SERVERS) | set(aliases.servers)
+    for server in sorted(servers, key=len, reverse=True):
+        if server and server in text:
+            return server
+    return ""
+
+
+def text_date(text: str) -> str:
+    if match := re.search(r"\d{4}-\d{2}-\d{2}", text):
+        return match[0]
+    for word, days in DATE_WORDS.items():
+        if word in text:
+            return (datetime.now(CHINA_TIME).date() - timedelta(days=days)).isoformat()
+    return ""
+
+
+def text_mode(text: str) -> str:
+    for value in ("22", "33", "55", "2v2", "3v3", "5v5"):
+        if value in text:
+            return value
+    for word, value in MODE_WORDS.items():
+        if word in text:
+            return value
+    return ""
+
+
+def text_pool(text: str) -> str:
+    match = re.search(r"(?:前|top)\s*([0-9]{2,4}|[一二三四五六七八九十百千两]+)\s*名?",
+                      text, re.IGNORECASE)
+    if match:
+        number = score_number(match[1])
+        if number is not None and str(number) in RANK_LIMITS:
+            return str(number)
+    return ""
+
+
 def fallback_route(text: str, aliases: NameAliases) -> tuple[str, list[str]] | None:
-    """模型彻底失败后的最后兜底，只处理参数简单的明确问法。"""
+    """按问法直接得到动作和参数；模型失败时的兜底，也是明确问法的直查路径。"""
     if chat_only(text):
         return None
     actions = query_actions(text)
-    action = actions[0] if actions else ""
-    hearts = find_hearts(text, aliases)
-    match = SCHOOL_TOKEN.search(text)
-    school = hearts[0] if hearts else (match[1] if match else "")
-    mode = next((value for value in ("22", "33", "55", "2v2", "3v3", "5v5") if value in text), "")
-    if action == "奇穴" and school:
-        extra = [] if "套路" in text else ["套路=1"]
-        return action, [school, *extra]
-    if action in {"门派", "阵法", "配置总览"} and school:
-        return action, [school]
-    if action == "技能":
+    if not actions:
         return None
+    action = actions[0]
+    hearts = find_hearts(text, aliases)
+    school_match = SCHOOL_TOKEN.search(text)
+    school = hearts[0] if hearts else (school_match[1] if school_match else "")
+    mode = text_mode(text)
+    date = text_date(text)
+    count_match = re.search(r"([0-9]{1,3})\s*场", text)
+    count = f"{count_match[1]}场" if count_match else ""
+    queue = "单排" if "单排" in text else "组排" if "组排" in text else ""
+    role_type = strength_role(text)
+    pool = text_pool(text)
+    if action in ROLE_QUERY_ACTIONS:
+        match = ROLE_AFTER.search(text)
+        if match and match[2]:
+            server, name = match[1], match[2]
+        else:
+            part = ""
+            cleaned = ROLE_PREFIX.sub("", text)
+            for pattern in (ROLE_BEFORE, ROLE_BEFORE_RECENT):
+                if found := pattern.search(cleaned):
+                    part = found[1]
+                    break
+            if not part and match:
+                part = match[1]
+            if not part:
+                return None
+            server, name = split_role_name(part)
+        args = ([server] if server else []) + [name]
+        if mode:
+            args.append(mode)
+        if count:
+            args.append(count)
+        if date:
+            args.append(date)
+        if action == "战绩复盘" and queue:
+            args.append(queue)
+        return action, args
+    if action == "技能":
+        pair = SKILL_PAIR.search(text)
+        return (action, [pair[1], pair[2]]) if pair else None
+    if action == "奇穴" and school:
+        return action, [school, *([] if "套路" in text else ["套路=1"])]
+    if action in {"门派", "阵法"} and school:
+        return action, [school]
+    if action == "配置总览":
+        args = []
+        if school:
+            args.append(school)
+        if pool:
+            args.append(f"Top{pool}")
+        if role_type:
+            args.append(role_type)
+        return action, args
     if action == "配队":
         return action, []
     if action == "环境":
         return action, environment_args(text)
-    if action in {"分布", "每日走势"}:
-        return action, ([mode] if mode else [])
+    if action == "分布":
+        args = [mode] if mode else []
+        period = "周内每日" if "周内每日" in text else "历周走势" if "历周走势" in text else ""
+        if period:
+            args.append(period)
+        return action, args
+    if action == "每日走势":
+        args = [mode] if mode else []
+        if hearts:
+            args.append(",".join(hearts[:3]))
+        if "较首日" in text:
+            args.append("较首日")
+        return action, args
     if action == "排行":
-        return action, ([hearts[0]] if hearts else []) + ([mode] if mode else [])
+        args = []
+        if hearts:
+            args.append(hearts[0])
+        server = find_server(text, aliases)
+        if server:
+            args.append(server)
+        if mode:
+            args.append(mode)
+        if pool:
+            args.append(pool)
+        return action, args
     if action == "强度":
-        role = strength_role(text)
-        return action, ([role] if role else [])
+        args = []
+        if role_type:
+            args.append(role_type)
+        if queue:
+            args.append(queue)
+        score = ""
+        if match := re.search(r"([0-9]{3,4})\s*分?(?:以上|\+)", text):
+            score = match[1] + "+"
+        elif match := re.search(r"([0-9]{3,4})\s*[-–到]\s*([0-9]{3,4})", text):
+            score = f"{match[1]}-{match[2]}"
+        if score:
+            args.append(score)
+        period = next((value for value in ("近7天", "近1天", "当前") if value in text), "")
+        if period:
+            args.append(period)
+        return action, args
     if action == "对位" and hearts:
         return action, hearts[:2]
+    if action in {"名剑帮助", "名剑流程"}:
+        return action, []
     return None
 
 
@@ -613,11 +763,13 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.68")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.69")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.aliases = NameAliases.from_config(config)
+        global CURRENT_ALIASES
+        CURRENT_ALIASES = self.aliases
         self.role_nicknames = index_role_nicknames((config or {}).get("role_nicknames"))
         self.natural = NaturalLanguage(context, config)
         try:
@@ -687,8 +839,8 @@ class Mingjian(Star):
             f"缓存：路由命中 {CACHE_HITS} 次 · 当前 {len(ROUTE_CACHE)} 条",
             f"最近一次：{stage_text}",
             f"最近错误：{error_text}",
-            f"运行统计：模型调用 {QUERY_STATS['tool']} · 补调 {QUERY_STATS['retry']} · "
-            f"文本路由 {QUERY_STATS['text']} · 失败 {QUERY_STATS['fail']}",
+            f"运行统计：规则直查 {QUERY_STATS['rule']} · 模型调用 {QUERY_STATS['tool']} · "
+            f"补调 {QUERY_STATS['retry']} · 文本路由 {QUERY_STATS['text']} · 失败 {QUERY_STATS['fail']}",
         )))
 
     async def _guide_result(self, event: AstrMessageEvent, card: Card, timing: QueryTiming | None = None):
@@ -933,6 +1085,33 @@ class Mingjian(Star):
             timing = event.get_extra(TIMING_KEY)
             event.set_extra(TIMING_KEY, None)
             await self._send_timed(event, response, timing)
+
+    @filter.custom_filter(DirectQuery, priority=100)
+    async def direct_query(self, event: AstrMessageEvent):
+        """明确的自然语言查询直接执行，不依赖模型是否调用工具。"""
+        route = direct_query_route(event)
+        if route is None or event.is_stopped():
+            return
+        action, args = route
+        text = normalize("NFKC", event.get_message_str().strip())
+        now = monotonic()
+        key = chat_key(event)
+        if self.natural.cooldown and now - LAST_QUERY_AT.get(key, 0.0) < self.natural.cooldown:
+            return
+        LAST_QUERY_AT[key] = now
+        logger.info(f"名剑规则直查 动作={action} 参数={args}")
+        LAST_STAGE[key] = ("规则直查", now)
+        QUERY_STATS["rule"] += 1
+        event.stop_event()
+        if action in {"名剑帮助", "名剑流程"}:
+            card = help_card() if action == "名剑帮助" else flow_card()
+            await self._send_timed(event, await self._guide_result(event, card), QueryTiming(action))
+        else:
+            async for response in self._execute(event, action, list(args)):
+                timing = event.get_extra(TIMING_KEY)
+                event.set_extra(TIMING_KEY, None)
+                await self._send_timed(event, response, timing)
+        remember_query(event, text, action)
 
     @filter.on_llm_request()
     async def guide_query_tool(self, event: AstrMessageEvent, request: ProviderRequest):
