@@ -28,7 +28,7 @@ from .matchups import parse_matchup
 from .natural import CHINA_TIME, QUERY_ACTIONS, SYSTEM_PROMPT as NATURAL_SYSTEM_PROMPT, NaturalLanguage, correct_guide_action, parse_model_result
 from .query import (
     REVIEW_SUMMARY, ChoiceMenu, HistoryFilter, MODES, QueryError, QueryTarget, parse_configuration,
-    parse_environment, parse_history, parse_ranking, parse_strength, parse_tier, parse_trend,
+    RANK_LIMITS, parse_environment, parse_history, parse_ranking, parse_strength, parse_tier, parse_trend,
 )
 from .replays import MAX_EXPORT_BYTES, ReplayExport
 from .site import HOME, MingjianService
@@ -132,6 +132,10 @@ DIGEST_TOOL_HINT = (
     "topic 填 强度、对位 或 配队，只取文字摘要，不要调用 mingjian_query 出图。"
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
+PLUGIN_VERSION = "0.2.63"
+QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
+LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
+RECENT_QUERY: dict[tuple[str, str, str], tuple[str, float, tuple[str, ...], str]] = {}
 RECORD_NAME = r"[\w·丨]{1,24}"
 RECORD_SERVERS = frozenset({
     "眉间雪", "山海相逢", "九天", "龙争虎斗", "斗转星移", "乾坤一掷", "剑胆琴心", "绝代天骄",
@@ -300,6 +304,86 @@ def retry_args(action: str, args: object, text: str) -> list[str] | None:
     return values[:1]
 
 
+STRENGTH_ARG_FIXES = {
+    "dps": "输出", "DPS": "输出", "奶妈": "治疗", "奶": "治疗",
+    "近七天": "近7天", "近一周": "近7天", "当前周期": "当前", "全分段": "全部",
+}
+
+
+def normalize_args(action: str, args: object, text: str) -> list[str] | None:
+    """把模型常见的参数写法纠正成插件能解析的形式。"""
+    if not isinstance(args, list):
+        return None
+    values = [str(value).strip() for value in args if str(value).strip()]
+    if action == "环境":
+        return retry_args("环境", values, text) or []
+    if action == "强度":
+        fixed = []
+        for value in values:
+            value = STRENGTH_ARG_FIXES.get(value, value)
+            if match := re.fullmatch(r"([0-9]{3,4})\s*分?(?:以上|\+)", value):
+                value = match[1] + "+"
+            elif match := re.fullmatch(r"([0-9]{3,4})\s*[-–到]\s*([0-9]{3,4})\s*分?", value):
+                value = f"{match[1]}-{match[2]}"
+            if value not in fixed:
+                fixed.append(value)
+        return fixed
+    if action == "排行":
+        fixed = []
+        for value in values:
+            if value in {"名剑", "竞技场", "推栏", "pvp", "PVP", "jjc", "JJC"}:
+                continue
+            if match := re.fullmatch(r"前?([0-9]+)\s*名?", value):
+                if match[1] in RANK_LIMITS:
+                    value = match[1]
+            if value not in fixed:
+                fixed.append(value)
+        return fixed
+    if action in ROLE_QUERY_ACTIONS:
+        fixed = []
+        for value in values:
+            if value in {"最近", "近"}:
+                continue
+            for server in sorted(RECORD_SERVERS, key=len, reverse=True):
+                if value.startswith(server) and len(value) > len(server):
+                    fixed.extend([server, value[len(server):]])
+                    break
+            else:
+                fixed.append(value)
+        return fixed
+    return values
+
+
+FOLLOW_UP_PREFIX = re.compile(r"^\s*(?:那|那么|换成|改成|再|看看)\s*")
+FOLLOW_UP_SUFFIX = re.compile(r"\s*(?:呢|怎么样|怎么算|如何)\s*$")
+
+
+def follow_up_entity(text: str, aliases: NameAliases) -> str | None:
+    """「那奶妈呢」「换成单排」这类短追问里的实体。"""
+    entity = FOLLOW_UP_SUFFIX.sub("", FOLLOW_UP_PREFIX.sub("", text)).strip()
+    if not entity or len(entity) > 8:
+        return None
+    if entity in {"组排", "单排"} or re.fullmatch(STRENGTH_ROLE, entity, re.IGNORECASE):
+        return entity
+    if entity in HEART_NAMES or alias_key(entity) in aliases.hearts:
+        return entity
+    return None
+
+
+def route_prompt(event: AstrMessageEvent, text: str) -> str:
+    """补调和文本路由带上上一轮问句，支持「那奶妈呢」这类追问。"""
+    recent = RECENT_QUERY.get(chat_key(event))
+    if recent and monotonic() - recent[1] <= 120 and recent[0] != text:
+        return f"上一轮用户：{recent[0]}\n本轮用户：{text}"
+    return text
+
+
+def remember_query(event: AstrMessageEvent, text: str, action: str):
+    hint = {"强度": ROLE_STRENGTH_TOOL_HINT, "排行": RANK_TOOL_HINT,
+            "环境": ENV_TOOL_HINT}.get(action, GENERIC_TOOL_HINT)
+    RECENT_QUERY[chat_key(event)] = (text, monotonic(), (action,), hint)
+
+
 def query_actions(text: str) -> tuple[str, ...]:
     for pattern, actions in TOPIC_ACTIONS:
         if pattern.search(text):
@@ -373,7 +457,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.62")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.63")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -402,6 +486,29 @@ class Mingjian(Star):
     async def flow_mingjian(self, event: AstrMessageEvent):
         """发送名剑指令从入口到后续菜单的流程长图。"""
         yield await self._guide_result(event, flow_card())
+
+    @filter.command("名剑诊断")
+    async def diagnose(self, event: AstrMessageEvent):
+        """查看名剑插件的工具、模型和最近一次查询状态。"""
+        provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+        stage = LAST_STAGE.get(chat_key(event))
+        stage_text = (f"{stage[0]}（{int(monotonic() - stage[1])} 秒前）"
+                      if stage else "本会话还没有完成查询")
+        tool_text = "未知"
+        try:
+            toolset = self.context.provider_manager.llm_tools.get_full_tool_set()
+            tool_text = "已注册" if toolset.get_tool("mingjian_query") else "未注册"
+        except Exception:
+            pass
+        yield event.plain_result("\n".join((
+            f"名剑查询 v{PLUGIN_VERSION}",
+            f"工具：{tool_text}（人格未授权时日志会提示不可用）",
+            f"对话模型：{provider or '未配置'}",
+            f"自然语言：{'已开启' if self.natural.enabled else '未开启'} · 超时 {self.natural.timeout_seconds}s",
+            f"最近一次：{stage_text}",
+            f"运行统计：模型调用 {QUERY_STATS['tool']} · 补调 {QUERY_STATS['retry']} · "
+            f"文本路由 {QUERY_STATS['text']} · 失败 {QUERY_STATS['fail']}",
+        )))
 
     async def _guide_result(self, event: AstrMessageEvent, card: Card, timing: QueryTiming | None = None):
         timing = timing or QueryTiming(card.title)
@@ -620,10 +727,14 @@ class Mingjian(Star):
             if server not in RECORD_SERVERS and alias_key(server) not in self.aliases.servers:
                 return
         event.stop_event()
+        sent = False
         async for response in self._execute(event, "战绩", args):
             timing = event.get_extra(TIMING_KEY)
             event.set_extra(TIMING_KEY, None)
             await self._send_timed(event, response, timing)
+            sent = True
+        if sent:
+            remember_query(event, event.get_message_str().strip(), "战绩")
 
     @filter.on_llm_request()
     async def guide_query_tool(self, event: AstrMessageEvent, request: ProviderRequest):
@@ -680,15 +791,24 @@ class Mingjian(Star):
                 })
         else:
             actions = generic_query_actions(text)
+            hint = GENERIC_TOOL_HINT
+            if not actions:
+                recent = RECENT_QUERY.get(chat_key(event))
+                if (recent and monotonic() - recent[1] <= 120
+                        and follow_up_entity(text, self.aliases)):
+                    actions, hint = recent[2], recent[3]
             if actions:
-                request.system_prompt += "\n\n" + GENERIC_TOOL_HINT
+                request.system_prompt += "\n\n" + hint
                 if ready:
-                    event.set_extra(QUERY_RETRY_REQUEST, {
+                    payload = {
                         "actions": actions,
-                        "hint": GENERIC_TOOL_HINT,
+                        "hint": hint,
                         "system": (request.system_prompt or "")[:4000],
                         "tools": ToolSet([tool]),
-                    })
+                    }
+                    if actions == ("强度",) and (role := strength_role(text)):
+                        payload["role_type"] = role
+                    event.set_extra(QUERY_RETRY_REQUEST, payload)
         if isinstance(event.get_extra(QUERY_RETRY_REQUEST), dict):
             prompt = (request.prompt or "").rstrip()
             if "请调用 mingjian_query" not in prompt:
@@ -727,12 +847,16 @@ class Mingjian(Star):
         label = "/".join(actions)
         logger.info(f"名剑{label}请求未调用工具，开始模型补调。")
         try:
+            await self._send_query_progress(event, QueryTiming("补查"), "正在补查…")
+        except Exception:
+            pass
+        try:
             async with asyncio.timeout(min(self.natural.timeout_seconds, QUERY_RETRY_TIMEOUT)):
                 provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
                 if query_retry_finished(event):
                     return
                 retry = await self.context.llm_generate(
-                    chat_provider_id=provider, prompt=event.get_message_str(), tools=tools,
+                    chat_provider_id=provider, prompt=route_prompt(event, text), tools=tools,
                     system_prompt=system, tool_choice="required",
                 ) if provider else None
         except Exception as exc:
@@ -744,8 +868,8 @@ class Mingjian(Star):
                 and len(retry.tools_call_args or []) == 1):
             tool_call = retry.tools_call_args[0]
             chosen = tool_call.get("action") if isinstance(tool_call, dict) else None
-            args = retry_args(chosen, tool_call.get("args") if isinstance(tool_call, dict) else None,
-                              normalize("NFKC", event.get_message_str().strip()))
+            args = normalize_args(chosen or "",
+                                  tool_call.get("args") if isinstance(tool_call, dict) else None, text)
             if chosen in actions and args is not None and valid_chat_args(args):
                 args = [value.strip() for value in args]
                 if chosen in {"名剑帮助", "名剑流程"}:
@@ -759,6 +883,7 @@ class Mingjian(Star):
                         valid = False
                 if valid:
                     logger.info(f"名剑工具补调成功 动作={chosen} 参数={args}")
+                    event.set_extra("mingjian_stage", "工具补调")
                     async for _ in self.mingjian_query(event, chosen, args):
                         pass
                     if query_retry_finished(event):
@@ -767,6 +892,7 @@ class Mingjian(Star):
             routed = await self._text_route(event, text)
             if routed is not None and routed[0] in actions:
                 action, route_args = routed
+                route_args = normalize_args(action, route_args, text)
                 valid = True
                 if action not in {"名剑帮助", "名剑流程"}:
                     try:
@@ -775,6 +901,7 @@ class Mingjian(Star):
                         valid = False
                 if valid:
                     logger.info(f"名剑文本补调成功 动作={action} 参数={route_args}")
+                    event.set_extra("mingjian_stage", "文本补调")
                     async for _ in self.mingjian_query(event, action, route_args):
                         pass
                     if query_retry_finished(event):
@@ -790,6 +917,8 @@ class Mingjian(Star):
                 logger.warning(f"名剑环境兜底查询失败 类型={type(exc).__name__}")
             if query_retry_finished(event):
                 return
+        QUERY_STATS["fail"] += 1
+        LAST_STAGE[chat_key(event)] = ("查询失败", monotonic())
         response.result_chain = None
         if actions == ("强度",):
             response.completion_text = (
@@ -815,7 +944,7 @@ class Mingjian(Star):
             async with asyncio.timeout(min(self.natural.timeout_seconds, QUERY_RETRY_TIMEOUT)):
                 response = await self.context.llm_generate(
                     chat_provider_id=provider,
-                    prompt=f"北京时间日期 {date}\n用户原话\n{text}",
+                    prompt=f"北京时间日期 {date}\n用户原话\n{route_prompt(event, text)}",
                     system_prompt=NATURAL_SYSTEM_PROMPT,
                 )
         except Exception as exc:
@@ -905,8 +1034,10 @@ class Mingjian(Star):
             return
         event.set_extra(CHAT_TOOL_USED, True)
         action = correct_guide_action(text, action)
-        if action == "环境":
-            args = retry_args("环境", args, text) or []
+        args = normalize_args(action, args, text)
+        stage = event.get_extra("mingjian_stage") or "模型调用工具"
+        LAST_STAGE[chat_key(event)] = (stage, monotonic())
+        QUERY_STATS[{"模型调用工具": "tool", "工具补调": "retry", "文本补调": "text"}.get(stage, "tool")] += 1
 
         if action in {"名剑帮助", "名剑流程"}:
             result = await self._guide_result(event, help_card() if action == "名剑帮助" else flow_card())
@@ -920,7 +1051,10 @@ class Mingjian(Star):
             await self._send_timed(event, result, timing)
         elif not event.is_stopped():
             logger.warning(f"名剑工具没有生成结果 操作={action}")
+            QUERY_STATS["fail"] += 1
+            LAST_STAGE[chat_key(event)] = ("空结果", monotonic())
             await event.send(event.plain_result("没有生成查询结果，请重新发送或发送 /名剑帮助 查看用法。"))
+        remember_query(event, text, action)
         # The tool already sent its result. Finish this event without a second AI reply.
         event.clear_result()
         event.stop_event()
@@ -974,7 +1108,7 @@ class Mingjian(Star):
             if _chats.get(key) is state and not state.can_navigate():
                 _chats.pop(key, None)
 
-    async def _send_query_progress(self, event: AstrMessageEvent, timing: QueryTiming):
+    async def _send_query_progress(self, event: AstrMessageEvent, timing: QueryTiming, label: str = "查询中"):
         chain = []
         platform = event.get_platform_name()
         message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "").strip()
@@ -984,7 +1118,7 @@ class Mingjian(Star):
             sender_id = str(event.get_sender_id())
             if sender_id.isdecimal():
                 chain.append(components.At(qq=sender_id))
-        chain.append(components.Plain("查询中"))
+        chain.append(components.Plain(label))
         started = monotonic()
         try:
             async with asyncio.timeout(3):
