@@ -143,7 +143,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.67"
+PLUGIN_VERSION = "0.2.68"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -463,6 +463,58 @@ class CachedQuery(filter.CustomFilter):
         return cached_route(event) is not None
 
 
+SCHOOL_TOKEN = re.compile(
+    r"(?:查|看|帮我|给我)?[一下]*(?:剑(?:网)?[三3])?\s*([\w·丨]{2,8}?)(?:的)?\s*"
+    r"(?:门派|资料|阵法|奇穴|技能)")
+
+
+def find_hearts(text: str, aliases: NameAliases) -> list[str]:
+    found = []
+    for alias, targets in sorted(aliases.hearts.items(), key=lambda item: -len(item[0])):
+        if len(targets) == 1 and alias and alias in text and targets[0] not in found:
+            found.append(targets[0])
+    for alias in sorted(HEART_NAMES, key=len, reverse=True):
+        if not re.search(r"[\u4e00-\u9fff]", alias) or alias not in text:
+            continue
+        name = HEART_NAMES[alias]
+        if name not in found:
+            found.append(name)
+    return found
+
+
+def fallback_route(text: str, aliases: NameAliases) -> tuple[str, list[str]] | None:
+    """模型彻底失败后的最后兜底，只处理参数简单的明确问法。"""
+    if chat_only(text):
+        return None
+    actions = query_actions(text)
+    action = actions[0] if actions else ""
+    hearts = find_hearts(text, aliases)
+    match = SCHOOL_TOKEN.search(text)
+    school = hearts[0] if hearts else (match[1] if match else "")
+    mode = next((value for value in ("22", "33", "55", "2v2", "3v3", "5v5") if value in text), "")
+    if action == "奇穴" and school:
+        extra = [] if "套路" in text else ["套路=1"]
+        return action, [school, *extra]
+    if action in {"门派", "阵法", "配置总览"} and school:
+        return action, [school]
+    if action == "技能":
+        return None
+    if action == "配队":
+        return action, []
+    if action == "环境":
+        return action, environment_args(text)
+    if action in {"分布", "每日走势"}:
+        return action, ([mode] if mode else [])
+    if action == "排行":
+        return action, ([hearts[0]] if hearts else []) + ([mode] if mode else [])
+    if action == "强度":
+        role = strength_role(text)
+        return action, ([role] if role else [])
+    if action == "对位" and hearts:
+        return action, hearts[:2]
+    return None
+
+
 def query_actions(text: str) -> tuple[str, ...]:
     for pattern, actions in TOPIC_ACTIONS:
         if pattern.search(text):
@@ -561,7 +613,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.67")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.68")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -1062,6 +1114,21 @@ class Mingjian(Star):
                         pass
                     if query_retry_finished(event):
                         return
+        if not query_retry_finished(event):
+            routed_fallback = fallback_route(text, self.aliases)
+            if routed_fallback and routed_fallback[0] in actions:
+                action, args = routed_fallback
+                try:
+                    await self._query(event, action, list(args))
+                except QueryError:
+                    pass
+                else:
+                    logger.info(f"名剑规则兜底成功 动作={action} 参数={args}")
+                    event.set_extra("mingjian_stage", "规则兜底")
+                    async for _ in self.mingjian_query(event, action, args):
+                        pass
+                    if query_retry_finished(event):
+                        return
         fallback = retry_request.get("fallback")
         if (actions == ("环境",) and valid_chat_args(fallback)
                 and not query_retry_finished(event)):
@@ -1203,7 +1270,8 @@ class Mingjian(Star):
         action = correct_guide_action(text, action)
         args = normalize_args(action, args, text)
         LAST_STAGE[chat_key(event)] = (stage, now)
-        QUERY_STATS[{"模型调用工具": "tool", "工具补调": "retry", "文本补调": "text"}.get(stage, "tool")] += 1
+        QUERY_STATS[{"模型调用工具": "tool", "工具补调": "retry", "文本补调": "text",
+                    "规则兜底": "text"}.get(stage, "tool")] += 1
 
         if action in {"名剑帮助", "名剑流程"}:
             result = await self._guide_result(event, help_card() if action == "名剑帮助" else flow_card())
