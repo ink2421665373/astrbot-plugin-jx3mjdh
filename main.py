@@ -154,9 +154,9 @@ ENV_OTHER = re.compile(r"变量|运行环境|开发环境|部署|服务器环境
 ENV_WORDS = ("剑网三", "剑三", "名剑", "竞技场", "推栏", "pvp", "jjc", "本周", "当前", "组排", "单排")
 ENV_CONTEXT = frozenset({"剑网三", "剑三", "名剑", "竞技场", "推栏", "pvp", "jjc", "组排", "单排"})
 ENV_TOOL_HINT = (
-    "用户明确要查询名剑 PVP 环境速览时，请调用 mingjian_query，action 填环境。"
-    "只保留用户明确给出的排队类型：组排或单排；「本周」「当前」是默认范围，可省略。"
-    "例如「查一下本周组排PVP环境」的 args 为 [\"组排\"]。"
+    "用户明确要查询名剑 PVP 环境速览时，必须调用 mingjian_query，action 固定填「环境」。"
+    "args 只能填「组排」或「单排」，没有明确写就填空数组；不要填 本周、当前、pvp、jjc。"
+    "例如「查一下本周组排PVP环境」的 args 为 [\"组排\"]，「本周单排pvp环境」的 args 为 [\"单排\"]。"
 )
 
 
@@ -267,6 +267,20 @@ def environment_args(text: str) -> list[str]:
     return ["单排"] if "单排" in compact and "组排" not in compact else []
 
 
+def retry_args(action: str, args: object, text: str) -> list[str] | None:
+    """补调返回的环境参数以消息里的排队类型为准。"""
+    if action != "环境":
+        return args if isinstance(args, list) else None
+    compact = re.sub(r"\s+", "", text)
+    if "单排" in compact:
+        return ["单排"]
+    if "组排" in compact:
+        return ["组排"]
+    values = [value.strip() for value in (args or [])
+              if isinstance(value, str) and value.strip() in {"组排", "单排"}]
+    return values[:1]
+
+
 def query_actions(text: str) -> tuple[str, ...]:
     for pattern, actions in TOPIC_ACTIONS:
         if pattern.search(text):
@@ -333,26 +347,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-def direct_environment_args(event: AstrMessageEvent) -> list[str] | None:
-    """明确的环境问法直接查询，不依赖对话模型。"""
-    if not event.is_at_or_wake_command:
-        return None
-    text = normalize("NFKC", event.get_message_str().strip())
-    if text.startswith(("/", "／")):
-        return None
-    if not (ENV_TOPIC.search(text) and ENV_GAME.search(text)) or ENV_OTHER.search(text):
-        return None
-    if chat_only(text) or not (bare_environment_query(text) or explicit_request(text)):
-        return None
-    return environment_args(text)
-
-
-class DirectEnvironment(filter.CustomFilter):
-    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
-        return direct_environment_args(event) is not None
-
-
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.56")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.57")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -598,18 +593,6 @@ class Mingjian(Star):
             event.set_extra(TIMING_KEY, None)
             await self._send_timed(event, response, timing)
 
-    @filter.custom_filter(DirectEnvironment, priority=100)
-    async def direct_environment(self, event: AstrMessageEvent):
-        """查询明确的环境短句，直接复用环境指令。"""
-        args = direct_environment_args(event)
-        if args is None:
-            return
-        event.stop_event()
-        async for response in self._execute(event, "环境", args):
-            timing = event.get_extra(TIMING_KEY)
-            event.set_extra(TIMING_KEY, None)
-            await self._send_timed(event, response, timing)
-
     @filter.on_llm_request()
     async def guide_query_tool(self, event: AstrMessageEvent, request: ProviderRequest):
         """为明确的数据查询补充工具用法，并为讨论补一份数据摘要说明。"""
@@ -658,6 +641,7 @@ class Mingjian(Star):
                     "actions": ("环境",),
                     "hint": ENV_TOOL_HINT,
                     "tools": ToolSet([tool]),
+                    "fallback": environment_args(text),
                 })
         else:
             actions = generic_query_actions(text)
@@ -712,8 +696,9 @@ class Mingjian(Star):
                 and len(retry.tools_call_args or []) == 1):
             tool_call = retry.tools_call_args[0]
             chosen = tool_call.get("action") if isinstance(tool_call, dict) else None
-            if (chosen in actions and isinstance(tool_call, dict)
-                    and valid_chat_args(args := tool_call.get("args"))):
+            args = retry_args(chosen, tool_call.get("args") if isinstance(tool_call, dict) else None,
+                              normalize("NFKC", event.get_message_str().strip()))
+            if chosen in actions and args is not None and valid_chat_args(args):
                 args = [value.strip() for value in args]
                 try:
                     parsed = await self._query(event, chosen, list(args))
@@ -726,6 +711,17 @@ class Mingjian(Star):
                         pass
                     if query_retry_finished(event):
                         return
+        fallback = retry_request.get("fallback")
+        if (actions == ("环境",) and valid_chat_args(fallback)
+                and not query_retry_finished(event)):
+            logger.info("名剑环境补调未返回有效工具调用，按消息中的排队类型直接查询。")
+            try:
+                async for _ in self.mingjian_query(event, "环境", fallback):
+                    pass
+            except Exception as exc:
+                logger.warning(f"名剑环境兜底查询失败 类型={type(exc).__name__}")
+            if query_retry_finished(event):
+                return
         response.result_chain = None
         if actions == ("强度",):
             response.completion_text = (
@@ -818,6 +814,8 @@ class Mingjian(Star):
             return
         event.set_extra(CHAT_TOOL_USED, True)
         action = correct_guide_action(text, action)
+        if action == "环境":
+            args = retry_args("环境", args, text) or []
 
         if action in {"名剑帮助", "名剑流程"}:
             result = await self._guide_result(event, help_card() if action == "名剑帮助" else flow_card())
