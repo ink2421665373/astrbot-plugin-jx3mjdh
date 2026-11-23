@@ -300,6 +300,15 @@ def parse_ranking(
     )
 
 
+def parse_environment(args: list[str]) -> tuple[str]:
+    filters = [token for token in args if token not in {"本周", "当前"}]
+    if not filters:
+        return ("组排",)
+    if len(filters) == 1 and filters[0] in {"组排", "单排"}:
+        return (filters[0],)
+    raise QueryError("用法：/剑三 环境 [组排/单排]。环境速览默认查看本周。")
+
+
 def parse_strength(args: list[str]) -> Strength:
     values = {}
     for arg in args:

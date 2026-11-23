@@ -9,8 +9,9 @@ from unicodedata import normalize
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api import message_components as components
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.agent.tool import ToolSet
 
 from .ai_review import REVIEW_ACTION, REVIEW_REPORTS, review_data
 from .aliases import MAX_ROLES_PER_NICKNAME, NameAliases, index_role_nicknames
@@ -19,13 +20,13 @@ from .dashboard import register_settings_page
 from .data import ApiError
 from .flow_content import flow_card
 from .help_content import help_card
-from .labels import alias_key
+from .labels import HEART_NAMES, alias_key
 from .matches import RecordQuery, Role
 from .matchups import parse_matchup
-from .natural import QUERY_ACTIONS, NaturalLanguage
+from .natural import QUERY_ACTIONS, NaturalLanguage, correct_guide_action
 from .query import (
     REVIEW_SUMMARY, ChoiceMenu, HistoryFilter, MODES, QueryError, QueryTarget, parse_configuration,
-    parse_history, parse_ranking, parse_strength, parse_tier, parse_trend,
+    parse_environment, parse_history, parse_ranking, parse_strength, parse_tier, parse_trend,
 )
 from .replays import MAX_EXPORT_BYTES, ReplayExport
 from .site import HOME, MingjianService
@@ -50,6 +51,9 @@ MAX_MENU_HISTORY = 16
 REPLY_PLATFORMS = {"aiocqhttp", "qq_official", "telegram", "discord", "satori", "kook", "mattermost"}
 TIMING_KEY = "astrbot_plugin_mingjian.timing"
 CHAT_TOOL_USED = "astrbot_plugin_mingjian.chat_tool_used"
+RANK_RETRY_TOOLS = "astrbot_plugin_mingjian.rank_retry_tools"
+RANK_RETRY_ATTEMPTED = "astrbot_plugin_mingjian.rank_retry_attempted"
+RANK_RETRY_TIMEOUT = 15
 ROLE_QUERY_ACTIONS = {"战绩", "战绩复盘", "角色总览"}
 CHAT_QUERY_TOPIC = re.compile(
     r"剑(?:网)?[三3]|名剑|推栏|竞技场|战绩|对局|回放|奇穴|排行|排名|榜单|胜率|出场率|"
@@ -82,10 +86,24 @@ ROLE_STRENGTH_TOOL_HINT = (
     "奶妈或治疗的 args 加入治疗；DPS 或输出的 args 加入输出。只保留用户明确给出的其他筛选。"
     "普通玩家名次榜使用排行。"
 )
+RANK_CHAT_TOPIC = re.compile(r"排行|榜单")
+RANK_CHAT_OTHER_TOPIC = re.compile(r"强度|战绩|配置|配队|分布|走势|帮助|流程|用法|怎么|如何|什么用|什么意思|(?:不要|不用)查")
+RANK_CHAT_GAME = re.compile(r"剑(?:网)?[三3]|名剑|竞技场|推栏|心法")
+RANK_CHAT_HEARTS = frozenset(HEART_NAMES) | frozenset(HEART_NAMES.values())
+RANK_TOOL_HINT = (
+    "用户明确要求查询名剑玩家排行榜或发送榜单图时，调用 mingjian_query，action 填排行。"
+    "例如「帮我查剑三花间游的 3v3 排行榜，发榜单图」的 args 为 [\"花间游\",\"33\"]。"
+    "图卡会由工具发送；只有工具返回后才可确认查询结果。"
+)
 
 
 def chat_key(event: AstrMessageEvent) -> tuple[str, str, str]:
     return event.unified_msg_origin, str(event.get_self_id()), str(event.get_sender_id())
+
+
+def rank_retry_finished(event: AstrMessageEvent) -> bool:
+    return (event.is_stopped() or bool(event.get_extra(CHAT_TOOL_USED))
+            or bool(event.get_extra("agent_user_aborted")) or bool(event.get_extra("agent_stop_requested")))
 
 
 def selection_number(event: AstrMessageEvent) -> int | None:
@@ -134,7 +152,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.46")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.47")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -206,11 +224,7 @@ class Mingjian(Star):
         if action == "对位":
             return parse_matchup(args, self.aliases)
         if action == "环境":
-            if not args:
-                return ("组排",)
-            if len(args) == 1 and args[0] in {"组排", "单排"}:
-                return (args[0],)
-            raise QueryError("用法：/剑三 环境 [组排/单排]")
+            return parse_environment(args)
         if action == "排行":
             choosing_filters = bool(args and args[0] == "筛选")
             query = parse_ranking(
@@ -385,13 +399,56 @@ class Mingjian(Star):
             await self._send_timed(event, response, timing)
 
     @filter.on_llm_request()
-    async def guide_role_strength_query(self, event: AstrMessageEvent, request: ProviderRequest):
-        """为模型补充输出和治疗强度的工具用法。"""
+    async def guide_query_tool(self, event: AstrMessageEvent, request: ProviderRequest):
+        """为明确的心法强度或玩家排行榜请求补充工具用法。"""
         tool = request.func_tool.get_tool("mingjian_query") if request.func_tool else None
+        if not tool or not tool.active:
+            return
         text = event.get_message_str().strip()
-        if (tool and tool.active and ROLE_STRENGTH_TOPIC.search(text)
-                and (re.match(QUERY_VERB, text) or BARE_ROLE_STRENGTH.fullmatch(text))):
+        explicit_query = re.match(QUERY_VERB, text)
+        if ROLE_STRENGTH_TOPIC.search(text) and (explicit_query or BARE_ROLE_STRENGTH.fullmatch(text)):
             request.system_prompt += "\n\n" + ROLE_STRENGTH_TOOL_HINT
+        elif (explicit_query and RANK_CHAT_TOPIC.search(text) and not RANK_CHAT_OTHER_TOPIC.search(text)
+              and (RANK_CHAT_GAME.search(text) or any(heart in text for heart in RANK_CHAT_HEARTS))):
+            request.system_prompt += "\n\n" + RANK_TOOL_HINT
+            if not event.get_extra(RANK_RETRY_ATTEMPTED) and not rank_retry_finished(event):
+                event.set_extra(RANK_RETRY_TOOLS, ToolSet([tool]))
+
+    @filter.on_llm_response()
+    async def retry_rank_tool(self, event: AstrMessageEvent, response: LLMResponse | None):
+        """明确的名剑榜单请求漏调工具时，让当前模型补选一次。"""
+        tools = event.get_extra(RANK_RETRY_TOOLS)
+        if tools is None:
+            return
+        if rank_retry_finished(event):
+            event.set_extra(RANK_RETRY_TOOLS, None)
+            return
+        if response is None or response.role != "assistant" or response.tools_call_name:
+            return
+        event.set_extra(RANK_RETRY_TOOLS, None)
+        event.set_extra(RANK_RETRY_ATTEMPTED, True)
+        logger.info("名剑排行榜请求未调用工具，开始模型补调。")
+        try:
+            async with asyncio.timeout(min(self.natural.timeout_seconds, RANK_RETRY_TIMEOUT)):
+                provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+                retry = await self.context.llm_generate(
+                    chat_provider_id=provider, prompt=event.get_message_str(), tools=tools,
+                    system_prompt=RANK_TOOL_HINT, tool_choice="required",
+                ) if provider else None
+        except Exception as exc:
+            logger.warning(f"名剑排行榜工具补调失败 类型={type(exc).__name__}")
+            retry = None
+        if rank_retry_finished(event):
+            return
+        if retry and retry.tools_call_name == ["mingjian_query"] and len(retry.tools_call_args or []) == 1:
+            request = retry.tools_call_args[0]
+            if isinstance(request, dict) and request.get("action") == "排行":
+                async for _ in self.mingjian_query(event, "排行", request.get("args")):
+                    pass
+                if rank_retry_finished(event):
+                    return
+        response.result_chain = None
+        response.completion_text = "模型未成功调用名剑排行榜工具，没有生成榜单图。可以发送 /剑三 排行 查询。"
 
     @filter.llm_tool(name="mingjian_query")
     async def mingjian_query(self, event: AstrMessageEvent, action: str = "", args: list[str] | None = None):
@@ -400,6 +457,9 @@ class Mingjian(Star):
         日常聊天、打法建议或模糊评价走原生对话。例如「花间游怎么打苍云」不调用。「花间游最近强吗」先确认要数据还是打法。
         奶妈或治疗心法的强度榜是强度统计。对「查一下奶妈的心法强度排行」调用 action="强度"、args=["治疗"]。如果明确说 2200 分以上，参数填 "2200+"。普通玩家名次榜才用排行。
         DPS（也可写 dps）指输出。对「dps强度排行」或「查一下输出心法强度排行」调用 action="强度"、args=["输出"]。
+        「查一下本周组排PVP环境」调用 action="环境"、args=["组排"]。「本周」和「当前」是默认范围，可省略。
+        「帮我查剑三花间游的 3v3 排行榜，发榜单图」调用 action="排行"、args=["花间游","33"]。图卡由工具发送。
+        「给我名剑帮助图」调用 action="名剑帮助"；「给我名剑流程图」调用 action="名剑流程"，这两项 args 均为空数组。
         查战绩时必须有角色名、角色昵称或推栏数字 ID，区服可省略。照抄用户输入的昵称，由插件显示候选。用户没说明的筛选省略，禁止猜测角色、服务器或条件。
         查单场详情、回放或需要评价一场比赛时，先查角色战绩，然后由用户回复编号。图卡与菜单由插件直接发送。
 
@@ -421,6 +481,7 @@ class Mingjian(Star):
             yield "本条消息已经调用过名剑查询。可让用户回复菜单编号或发起下一次查询。"
             return
         event.set_extra(CHAT_TOOL_USED, True)
+        action = correct_guide_action(text, action)
 
         if action in {"名剑帮助", "名剑流程"}:
             result = await self._guide_result(event, help_card() if action == "名剑帮助" else flow_card())
