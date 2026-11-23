@@ -1,6 +1,7 @@
 import asyncio
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
@@ -24,7 +25,7 @@ from .help_content import help_card
 from .labels import HEART_NAMES, alias_key
 from .matches import RecordQuery, Role
 from .matchups import parse_matchup
-from .natural import QUERY_ACTIONS, NaturalLanguage, correct_guide_action
+from .natural import CHINA_TIME, QUERY_ACTIONS, SYSTEM_PROMPT as NATURAL_SYSTEM_PROMPT, NaturalLanguage, correct_guide_action, parse_model_result
 from .query import (
     REVIEW_SUMMARY, ChoiceMenu, HistoryFilter, MODES, QueryError, QueryTarget, parse_configuration,
     parse_environment, parse_history, parse_ranking, parse_strength, parse_tier, parse_trend,
@@ -68,7 +69,7 @@ TALK_ONLY = re.compile(
 OPINION_TALK = re.compile(r"厉害|强吗|强不强|值得|好用|好玩|推荐吗|难|离谱|没用|不行|奇怪|不对")
 QUERY_TOPIC_STRONG = re.compile(
     r"战绩|复盘|排行|排名|榜单|强度|环境|配队|阵容|分布|走势|奇穴|门派|技能|阵法|对位|"
-    r"配置总览|角色总览|胜率|出场率|段位|积分"
+    r"配置总览|角色总览|胜率|出场率|段位|积分|帮助|流程图"
 )
 TOPIC_ACTIONS = (
     (re.compile(r"战绩复盘|复盘"), ("战绩复盘",)),
@@ -86,10 +87,12 @@ TOPIC_ACTIONS = (
     (re.compile(r"强度"), ("强度",)),
     (re.compile(r"环境"), ("环境",)),
     (re.compile(r"战绩|对局"), ("战绩", "战绩复盘")),
+    (re.compile(r"帮助"), ("名剑帮助",)),
+    (re.compile(r"流程"), ("名剑流程",)),
 )
 GENERIC_ACTIONS = frozenset({
     "战绩", "战绩复盘", "角色总览", "配置总览", "对位", "配队", "分布", "每日走势",
-    "门派", "技能", "阵法", "奇穴",
+    "门派", "技能", "阵法", "奇穴", "名剑帮助", "名剑流程",
 })
 ENTITY_ACTIONS = frozenset({"技能", "门派", "阵法", "奇穴"})
 GENERIC_TOOL_HINT = (
@@ -285,6 +288,8 @@ def generic_query_actions(text: str) -> tuple[str, ...]:
     actions = tuple(action for action in query_actions(text) if action in GENERIC_ACTIONS)
     if not actions:
         return ()
+    if actions[0] in {"名剑帮助", "名剑流程"} and not re.search(r"剑(?:网)?[三3]|名剑", text):
+        return ()
     entity = (any(heart in text for heart in RANK_CHAT_HEARTS)
               or any(server in text for server in RECORD_SERVERS)
               or bool(re.search(r"22|33|55|2v2|3v3|5v5", text, re.IGNORECASE)))
@@ -342,7 +347,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.59")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.60")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -667,6 +672,7 @@ class Mingjian(Star):
                     logger.info("名剑数据查询返回空回复，补充提示。")
                     response.completion_text = "本次没有生成查询结果，可以发送 /剑三 或 /名剑帮助 重新查询。"
             return
+        text = normalize("NFKC", event.get_message_str().strip())
         if query_retry_finished(event):
             event.set_extra(QUERY_RETRY_REQUEST, None)
             return
@@ -707,14 +713,32 @@ class Mingjian(Star):
                               normalize("NFKC", event.get_message_str().strip()))
             if chosen in actions and args is not None and valid_chat_args(args):
                 args = [value.strip() for value in args]
-                try:
-                    parsed = await self._query(event, chosen, list(args))
-                    role_matches = (chosen != "强度"
-                                    or getattr(parsed, "role_type", None) == retry_request.get("role_type"))
-                except QueryError:
-                    role_matches = False
-                if role_matches:
+                if chosen in {"名剑帮助", "名剑流程"}:
+                    valid = True
+                else:
+                    try:
+                        parsed = await self._query(event, chosen, list(args))
+                        valid = (chosen != "强度"
+                                 or getattr(parsed, "role_type", None) == retry_request.get("role_type"))
+                    except QueryError:
+                        valid = False
+                if valid:
                     async for _ in self.mingjian_query(event, chosen, args):
+                        pass
+                    if query_retry_finished(event):
+                        return
+        if not query_retry_finished(event):
+            routed = await self._text_route(event, text)
+            if routed is not None and routed[0] in actions:
+                action, route_args = routed
+                valid = True
+                if action not in {"名剑帮助", "名剑流程"}:
+                    try:
+                        await self._query(event, action, list(route_args))
+                    except QueryError:
+                        valid = False
+                if valid:
+                    async for _ in self.mingjian_query(event, action, route_args):
                         pass
                     if query_retry_finished(event):
                         return
@@ -742,6 +766,27 @@ class Mingjian(Star):
             response.completion_text = (
                 f"模型未成功调用名剑{label}工具，没有生成图卡。可以发送 /名剑帮助 查看用法。"
             )
+
+    async def _text_route(self, event: AstrMessageEvent, text: str) -> tuple[str, list[str]] | None:
+        """工具调用失败后，用普通文本 JSON 再解析一次意图，覆盖全部动作。"""
+        try:
+            provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+            if not provider:
+                return None
+            date = datetime.now(CHINA_TIME).date().isoformat()
+            async with asyncio.timeout(min(self.natural.timeout_seconds, QUERY_RETRY_TIMEOUT)):
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider,
+                    prompt=f"北京时间日期 {date}\n用户原话\n{text}",
+                    system_prompt=NATURAL_SYSTEM_PROMPT,
+                )
+        except Exception as exc:
+            logger.warning(f"名剑文本补调失败 类型={type(exc).__name__}")
+            return None
+        try:
+            return parse_model_result(response.completion_text or "")
+        except QueryError:
+            return None
 
     @filter.llm_tool(name="mingjian_digest")
     async def mingjian_digest(self, event: AstrMessageEvent, topic: str = "", args: list[str] | None = None):

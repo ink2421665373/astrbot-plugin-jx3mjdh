@@ -1,7 +1,7 @@
 name: astrbot_plugin_mingjian
 display_name: 名剑查询
 desc: 通过剑网三 PVP 查询站的公开数据查询战绩、榜单、强度和门派资料。
-version: v0.2.59
+version: v0.2.60
 author: Codex
 repo: https://github.com/ink2421665373/astrbot-plugin-jx3mjdh
 astrbot_version: ">=4.16,<5"
