@@ -105,6 +105,21 @@ RANK_TOOL_HINT = (
     "例如「帮我查剑三花间游的 3v3 排行榜，发榜单图」的 args 为 [\"花间游\",\"33\"]。"
     "图卡会由工具发送；只有工具返回后才可确认查询结果。"
 )
+BARE_RANK = re.compile(
+    r"(?:剑(?:网)?[三3]|名剑|竞技场|推栏)?[\w·丨]{0,12}?"
+    r"(?:22|33|55|2v2|3v3|5v5)?(?:排行榜?|榜单?)",
+    re.IGNORECASE,
+)
+ENV_TOPIC = re.compile(r"环境", re.IGNORECASE)
+ENV_GAME = re.compile(r"剑(?:网)?[三3]|名剑|竞技场|推栏|pvp|jjc|组排|单排", re.IGNORECASE)
+ENV_OTHER = re.compile(r"变量|运行环境|开发环境|部署|服务器环境|系统环境|网络环境|电脑|配置环境")
+ENV_WORDS = ("剑网三", "剑三", "名剑", "竞技场", "推栏", "pvp", "jjc", "本周", "当前", "组排", "单排")
+ENV_CONTEXT = frozenset({"剑网三", "剑三", "名剑", "竞技场", "推栏", "pvp", "jjc", "组排", "单排"})
+ENV_TOOL_HINT = (
+    "用户明确要查询名剑 PVP 环境速览时，请调用 mingjian_query，action 填环境。"
+    "只保留用户明确给出的排队类型：组排或单排；「本周」「当前」是默认范围，可省略。"
+    "例如「查一下本周组排PVP环境」的 args 为 [\"组排\"]。"
+)
 
 
 def chat_key(event: AstrMessageEvent) -> tuple[str, str, str]:
@@ -128,6 +143,33 @@ def valid_chat_args(args: object) -> TypeGuard[list[str]]:
     return (isinstance(args, list) and len(args) <= 20
             and all(isinstance(value, str) and value.strip() and len(value) <= 100
                     and value.isprintable() for value in args))
+
+
+def bare_rank_query(text: str) -> bool:
+    """整句只有「对象 + 模式 + 排行/榜单」时视为明确榜单请求。"""
+    if not RANK_CHAT_TOPIC.search(text) or RANK_CHAT_OTHER_TOPIC.search(text):
+        return False
+    compact = re.sub(r"\s+", "", text)
+    return bool(BARE_RANK.fullmatch(compact)
+                and (RANK_CHAT_GAME.search(compact)
+                     or any(heart in compact for heart in RANK_CHAT_HEARTS)))
+
+
+def bare_environment_query(text: str) -> bool:
+    """整句由剑三、排队类型和「环境」组成时视为明确环境请求。"""
+    compact = re.sub(r"\s+", "", text).casefold().rstrip("，,。.！!？?~～…")
+    if ENV_OTHER.search(compact) or not compact.endswith("环境"):
+        return False
+    rest, seen = compact[:-2], set()
+    while rest:
+        for word in ENV_WORDS:
+            if rest.startswith(word):
+                seen.add(word)
+                rest = rest[len(word):]
+                break
+        else:
+            return False
+    return bool(seen & ENV_CONTEXT)
 
 
 def selection_number(event: AstrMessageEvent) -> int | None:
@@ -176,7 +218,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.49")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.50")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -441,13 +483,23 @@ class Mingjian(Star):
                     "tools": ToolSet([tool]),
                     "role_type": expected_role,
                 })
-        elif (explicit_query and RANK_CHAT_TOPIC.search(text) and not RANK_CHAT_OTHER_TOPIC.search(text)
+        elif ((explicit_query or bare_rank_query(text))
+              and RANK_CHAT_TOPIC.search(text) and not RANK_CHAT_OTHER_TOPIC.search(text)
               and (RANK_CHAT_GAME.search(text) or any(heart in text for heart in RANK_CHAT_HEARTS))):
             request.system_prompt += "\n\n" + RANK_TOOL_HINT
             if not event.get_extra(QUERY_RETRY_ATTEMPTED) and not query_retry_finished(event):
                 event.set_extra(QUERY_RETRY_REQUEST, {
                     "action": "排行",
                     "hint": RANK_TOOL_HINT,
+                    "tools": ToolSet([tool]),
+                })
+        elif (ENV_TOPIC.search(text) and ENV_GAME.search(text) and not ENV_OTHER.search(text)
+              and (explicit_query or bare_environment_query(text))):
+            request.system_prompt += "\n\n" + ENV_TOOL_HINT
+            if not event.get_extra(QUERY_RETRY_ATTEMPTED) and not query_retry_finished(event):
+                event.set_extra(QUERY_RETRY_REQUEST, {
+                    "action": "环境",
+                    "hint": ENV_TOOL_HINT,
                     "tools": ToolSet([tool]),
                 })
 
@@ -469,7 +521,7 @@ class Mingjian(Star):
         action = retry_request.get("action")
         hint = retry_request.get("hint")
         tools = retry_request.get("tools")
-        if action not in {"排行", "强度"} or not isinstance(hint, str) or not isinstance(tools, ToolSet):
+        if action not in {"排行", "强度", "环境"} or not isinstance(hint, str) or not isinstance(tools, ToolSet):
             return
         logger.info(f"名剑{action}请求未调用工具，开始模型补调。")
         try:
@@ -508,6 +560,8 @@ class Mingjian(Star):
             response.completion_text = (
                 "模型未成功调用名剑心法强度工具，没有生成强度图。可以发送 /剑三 强度 查询。"
             )
+        elif action == "环境":
+            response.completion_text = "模型未成功调用名剑环境工具，没有生成环境图。可以发送 /剑三 环境 查询。"
         else:
             response.completion_text = "模型未成功调用名剑排行榜工具，没有生成榜单图。可以发送 /剑三 排行 查询。"
 
@@ -528,8 +582,10 @@ class Mingjian(Star):
             action(string): 只选 战绩、战绩复盘、角色总览、排行、强度、配置总览、对位、环境、配队、分布、每日走势、门派、技能、阵法、奇穴、名剑帮助、名剑流程 中的一项。
             args(array[string]): 每个参数一项，按名剑指令填写。无筛选填空数组。例如「花间游的3v3前100排行」填 ["花间游","33","100"]，「梦江南的云晚归最近5场」填 ["梦江南","云晚归","5场"]。
         """
-        text = event.get_message_str().strip()
-        if not (CHAT_QUERY_TOPIC.search(text) and (CHAT_QUERY_REQUEST.search(text) or BARE_ROLE_STRENGTH.fullmatch(text))):
+        text = normalize("NFKC", event.get_message_str().strip())
+        if not (CHAT_QUERY_TOPIC.search(text)
+                and (CHAT_QUERY_REQUEST.search(text) or BARE_ROLE_STRENGTH.fullmatch(text)
+                     or bare_rank_query(text) or bare_environment_query(text))):
             yield "本条消息没有明确请求剑三数据。请继续原生聊天，意图不明确时可以询问用户。"
             return
         if (not isinstance(action, str) or action not in QUERY_ACTIONS or not valid_chat_args(args)
