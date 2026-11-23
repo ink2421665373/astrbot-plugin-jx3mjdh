@@ -261,6 +261,12 @@ def bare_environment_query(text: str) -> bool:
     return bool(seen & ENV_CONTEXT)
 
 
+def environment_fallback_args(text: str) -> list[str]:
+    """环境查询的兜底参数：只在明确说单排时传单排，其余按默认组排。"""
+    compact = re.sub(r"\s+", "", text)
+    return ["单排"] if "单排" in compact and "组排" not in compact else []
+
+
 def query_actions(text: str) -> tuple[str, ...]:
     for pattern, actions in TOPIC_ACTIONS:
         if pattern.search(text):
@@ -327,7 +333,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.54")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.55")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -621,6 +627,7 @@ class Mingjian(Star):
                     "actions": ("环境",),
                     "hint": ENV_TOOL_HINT,
                     "tools": ToolSet([tool]),
+                    "fallback": environment_fallback_args(text),
                 })
         else:
             actions = generic_query_actions(text)
@@ -689,15 +696,26 @@ class Mingjian(Star):
                         pass
                     if query_retry_finished(event):
                         return
+        fallback = retry_request.get("fallback")
+        if (actions == ("环境",) and valid_chat_args(fallback)
+                and not query_retry_finished(event)):
+            logger.info("名剑环境补调未返回有效工具调用，按消息中的排队类型直接查询。")
+            try:
+                async for _ in self.mingjian_query(event, "环境", fallback):
+                    pass
+            except Exception as exc:
+                logger.warning(f"名剑环境兜底查询失败 类型={type(exc).__name__}")
+            if query_retry_finished(event):
+                return
         response.result_chain = None
         if actions == ("强度",):
             response.completion_text = (
-                "模型未成功调用名剑心法强度工具，没有生成强度图。可以发送 /剑三 强度 查询。"
+                "模型未成功调用名剑心法强度工具，没有生成强度图。可以发送 /剑三 强度 或 /剑三 强度 治疗。"
             )
         elif actions == ("排行",):
-            response.completion_text = "模型未成功调用名剑排行榜工具，没有生成榜单图。可以发送 /剑三 排行 查询。"
+            response.completion_text = "模型未成功调用名剑排行榜工具，没有生成榜单图。可以发送 /剑三 排行。"
         elif actions == ("环境",):
-            response.completion_text = "模型未成功调用名剑环境工具，没有生成环境图。可以发送 /剑三 环境 查询。"
+            response.completion_text = "模型未成功调用名剑环境工具，没有生成环境图。可以发送 /剑三 环境 或 /剑三 环境 单排。"
         else:
             response.completion_text = (
                 f"模型未成功调用名剑{label}工具，没有生成图卡。可以发送 /名剑帮助 查看用法。"

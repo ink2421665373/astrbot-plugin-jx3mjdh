@@ -233,6 +233,8 @@ def parse_ranking(
 ) -> Ranking:
     values = {}
     for arg in args:
+        if arg == "查询":
+            continue
         key, sep, value = arg.replace("＝", "=").partition("=")
         if not sep:
             if PERIOD.fullmatch(arg):
@@ -301,7 +303,7 @@ def parse_ranking(
 
 
 def parse_environment(args: list[str]) -> tuple[str]:
-    filters = [token for token in args if token not in {"本周", "当前"}]
+    filters = [token for token in args if token not in {"本周", "当前", "查询"}]
     if not filters:
         return ("组排",)
     if len(filters) == 1 and filters[0] in {"组排", "单排"}:
@@ -312,6 +314,8 @@ def parse_environment(args: list[str]) -> tuple[str]:
 def parse_strength(args: list[str]) -> Strength:
     values = {}
     for arg in args:
+        if arg == "查询":
+            continue
         tag, sep, text = arg.replace("＝", "=", 1).partition("=")
         if tag == "周期" and sep and text:
             key, value = "period", text
