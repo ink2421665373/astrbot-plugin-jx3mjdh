@@ -61,9 +61,41 @@ CHAT_QUERY_TOPIC = re.compile(
     r"心法|门派|配队|阵容|段位|积分|技能|阵法|走势|强度|分布|对位|配置总览|角色总览|复盘|环境|"
     r"最近[零一二三四五六七八九十两\d]+\s*场"
 )
-CHAT_QUERY_REQUEST = re.compile(
-    r"^\s*看|查|搜|检索|看看|看一?下|(?:想|要|给我|帮我)看|我要|列出|显示|调出|拉取|"
-    r"给我|发(?:我|个|一张|张|一份|份)|多少|第几|什么名次|复盘|统计|图谱|排行榜|资料|帮助|流程图"
+CHAT_DISCUSSION = re.compile(
+    r"怎么打|如何打|打法|思路|技巧|攻略|教学|手法|为什么|为啥|评价|点评|厉害|强吗|强不强|"
+    r"值得|好用|好玩|推荐吗|选哪个|哪个好|区别|怎么玩|怎么算|怎么计算|怎么定义|定义|意思|"
+    r"是什么|怎么理解|难|离谱|没用|不行|奇怪|不对"
+)
+QUERY_TOPIC_STRONG = re.compile(
+    r"战绩|复盘|排行|排名|榜单|强度|环境|配队|阵容|分布|走势|奇穴|门派|技能|阵法|对位|"
+    r"配置总览|角色总览|胜率|出场率|段位|积分"
+)
+TOPIC_ACTIONS = (
+    (re.compile(r"战绩复盘|复盘"), ("战绩复盘",)),
+    (re.compile(r"角色总览"), ("角色总览",)),
+    (re.compile(r"配置总览"), ("配置总览",)),
+    (re.compile(r"每日走势"), ("每日走势",)),
+    (re.compile(r"奇穴"), ("奇穴",)),
+    (re.compile(r"技能"), ("技能",)),
+    (re.compile(r"阵法"), ("阵法",)),
+    (re.compile(r"门派|资料"), ("门派",)),
+    (re.compile(r"对位"), ("对位",)),
+    (re.compile(r"配队|阵容"), ("配队",)),
+    (re.compile(r"分布"), ("分布",)),
+    (re.compile(r"排行|排名|榜单"), ("排行",)),
+    (re.compile(r"强度"), ("强度",)),
+    (re.compile(r"环境"), ("环境",)),
+    (re.compile(r"战绩|对局"), ("战绩", "战绩复盘")),
+)
+GENERIC_ACTIONS = frozenset({
+    "战绩", "战绩复盘", "角色总览", "配置总览", "对位", "配队", "分布", "每日走势",
+    "门派", "技能", "阵法", "奇穴",
+})
+ENTITY_ACTIONS = frozenset({"技能", "门派", "阵法", "奇穴"})
+GENERIC_TOOL_HINT = (
+    "用户在查询剑网三数据，请调用 mingjian_query 并选择对应 action。"
+    "可用 action：战绩、战绩复盘、角色总览、排行、强度、配置总览、对位、环境、配队、分布、每日走势、门派、技能、阵法、奇穴。"
+    "只保留用户明确给出的参数，不要猜测角色、服务器或筛选条件。"
 )
 RECORD_NAME = r"[\w·丨]{1,24}"
 RECORD_SERVERS = frozenset({
@@ -172,6 +204,27 @@ def bare_environment_query(text: str) -> bool:
     return bool(seen & ENV_CONTEXT)
 
 
+def query_actions(text: str) -> tuple[str, ...]:
+    for pattern, actions in TOPIC_ACTIONS:
+        if pattern.search(text):
+            return actions
+    return ()
+
+
+def generic_query_actions(text: str) -> tuple[str, ...]:
+    """明确的数据请求但未命中专用补调时，返回可接受的 action。"""
+    if CHAT_DISCUSSION.search(text) or not QUERY_TOPIC_STRONG.search(text):
+        return ()
+    actions = tuple(action for action in query_actions(text) if action in GENERIC_ACTIONS)
+    if not actions:
+        return ()
+    explicit = re.search(QUERY_VERB, text)
+    entity = (any(heart in text for heart in RANK_CHAT_HEARTS)
+              or any(server in text for server in RECORD_SERVERS)
+              or bool(re.search(r"22|33|55|2v2|3v3|5v5", text, re.IGNORECASE)))
+    return actions if explicit or entity or len(re.sub(r"\s+", "", text)) <= 12 else ()
+
+
 def selection_number(event: AstrMessageEvent) -> int | None:
     text = normalize("NFKC", event.get_message_str().strip())
     return int(text) if re.fullmatch(r"[0-9]{1,3}", text) else None
@@ -218,7 +271,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.50")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.51")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -466,19 +519,22 @@ class Mingjian(Star):
 
     @filter.on_llm_request()
     async def guide_query_tool(self, event: AstrMessageEvent, request: ProviderRequest):
-        """为明确的心法强度或玩家排行榜请求补充工具用法。"""
+        """为明确的数据查询补充工具用法，并在模型漏调时登记一次补选。"""
+        text = normalize("NFKC", event.get_message_str().strip())
         tool = request.func_tool.get_tool("mingjian_query") if request.func_tool else None
         if not tool or not tool.active:
+            if CHAT_QUERY_TOPIC.search(text) and not CHAT_DISCUSSION.search(text):
+                logger.info("名剑工具当前会话不可用，未补充查询说明；请检查人格工具权限、模型工具调用设置和唤醒方式。")
             return
-        text = normalize("NFKC", event.get_message_str().strip())
         explicit_query = re.search(QUERY_VERB, text)
+        ready = (not event.get_extra(QUERY_RETRY_ATTEMPTED)
+                 and not query_retry_finished(event))
         if ROLE_STRENGTH_TOPIC.search(text) and (explicit_query or BARE_ROLE_STRENGTH.fullmatch(text)):
             request.system_prompt += "\n\n" + ROLE_STRENGTH_TOOL_HINT
             expected_role = simple_role_strength_arg(text)
-            if (expected_role and not event.get_extra(QUERY_RETRY_ATTEMPTED)
-                    and not query_retry_finished(event)):
+            if expected_role and ready:
                 event.set_extra(QUERY_RETRY_REQUEST, {
-                    "action": "强度",
+                    "actions": ("强度",),
                     "hint": ROLE_STRENGTH_TOOL_HINT,
                     "tools": ToolSet([tool]),
                     "role_type": expected_role,
@@ -487,21 +543,31 @@ class Mingjian(Star):
               and RANK_CHAT_TOPIC.search(text) and not RANK_CHAT_OTHER_TOPIC.search(text)
               and (RANK_CHAT_GAME.search(text) or any(heart in text for heart in RANK_CHAT_HEARTS))):
             request.system_prompt += "\n\n" + RANK_TOOL_HINT
-            if not event.get_extra(QUERY_RETRY_ATTEMPTED) and not query_retry_finished(event):
+            if ready:
                 event.set_extra(QUERY_RETRY_REQUEST, {
-                    "action": "排行",
+                    "actions": ("排行",),
                     "hint": RANK_TOOL_HINT,
                     "tools": ToolSet([tool]),
                 })
         elif (ENV_TOPIC.search(text) and ENV_GAME.search(text) and not ENV_OTHER.search(text)
               and (explicit_query or bare_environment_query(text))):
             request.system_prompt += "\n\n" + ENV_TOOL_HINT
-            if not event.get_extra(QUERY_RETRY_ATTEMPTED) and not query_retry_finished(event):
+            if ready:
                 event.set_extra(QUERY_RETRY_REQUEST, {
-                    "action": "环境",
+                    "actions": ("环境",),
                     "hint": ENV_TOOL_HINT,
                     "tools": ToolSet([tool]),
                 })
+        else:
+            actions = generic_query_actions(text)
+            if actions:
+                request.system_prompt += "\n\n" + GENERIC_TOOL_HINT
+                if ready:
+                    event.set_extra(QUERY_RETRY_REQUEST, {
+                        "actions": actions,
+                        "hint": GENERIC_TOOL_HINT,
+                        "tools": ToolSet([tool]),
+                    })
 
     @filter.on_llm_response()
     async def retry_query_tool(self, event: AstrMessageEvent, response: LLMResponse | None):
@@ -518,12 +584,15 @@ class Mingjian(Star):
             return
         event.set_extra(QUERY_RETRY_REQUEST, None)
         event.set_extra(QUERY_RETRY_ATTEMPTED, True)
-        action = retry_request.get("action")
+        actions = retry_request.get("actions")
         hint = retry_request.get("hint")
         tools = retry_request.get("tools")
-        if action not in {"排行", "强度", "环境"} or not isinstance(hint, str) or not isinstance(tools, ToolSet):
+        if (not isinstance(actions, tuple) or not actions
+                or any(value not in QUERY_ACTIONS for value in actions)
+                or not isinstance(hint, str) or not isinstance(tools, ToolSet)):
             return
-        logger.info(f"名剑{action}请求未调用工具，开始模型补调。")
+        label = "/".join(actions)
+        logger.info(f"名剑{label}请求未调用工具，开始模型补调。")
         try:
             async with asyncio.timeout(min(self.natural.timeout_seconds, QUERY_RETRY_TIMEOUT)):
                 provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
@@ -534,36 +603,41 @@ class Mingjian(Star):
                     system_prompt=hint, tool_choice="required",
                 ) if provider else None
         except Exception as exc:
-            logger.warning(f"名剑{action}工具补调失败 类型={type(exc).__name__}")
+            logger.warning(f"名剑{label}工具补调失败 类型={type(exc).__name__}")
             retry = None
         if query_retry_finished(event):
             return
         if (retry and retry.role in {"assistant", "tool"} and retry.tools_call_name == ["mingjian_query"]
                 and len(retry.tools_call_args or []) == 1):
             tool_call = retry.tools_call_args[0]
-            if (isinstance(tool_call, dict) and tool_call.get("action") == action
+            chosen = tool_call.get("action") if isinstance(tool_call, dict) else None
+            if (chosen in actions and isinstance(tool_call, dict)
                     and valid_chat_args(args := tool_call.get("args"))):
                 args = [value.strip() for value in args]
                 try:
-                    parsed = await self._query(event, action, list(args))
-                    role_matches = (action != "强度"
+                    parsed = await self._query(event, chosen, list(args))
+                    role_matches = (chosen != "强度"
                                     or getattr(parsed, "role_type", None) == retry_request.get("role_type"))
                 except QueryError:
                     role_matches = False
                 if role_matches:
-                    async for _ in self.mingjian_query(event, action, args):
+                    async for _ in self.mingjian_query(event, chosen, args):
                         pass
                     if query_retry_finished(event):
                         return
         response.result_chain = None
-        if action == "强度":
+        if actions == ("强度",):
             response.completion_text = (
                 "模型未成功调用名剑心法强度工具，没有生成强度图。可以发送 /剑三 强度 查询。"
             )
-        elif action == "环境":
+        elif actions == ("排行",):
+            response.completion_text = "模型未成功调用名剑排行榜工具，没有生成榜单图。可以发送 /剑三 排行 查询。"
+        elif actions == ("环境",):
             response.completion_text = "模型未成功调用名剑环境工具，没有生成环境图。可以发送 /剑三 环境 查询。"
         else:
-            response.completion_text = "模型未成功调用名剑排行榜工具，没有生成榜单图。可以发送 /剑三 排行 查询。"
+            response.completion_text = (
+                f"模型未成功调用名剑{label}工具，没有生成图卡。可以发送 /名剑帮助 查看用法。"
+            )
 
     @filter.llm_tool(name="mingjian_query")
     async def mingjian_query(self, event: AstrMessageEvent, action: str = "", args: list[str] | None = None):
@@ -583,10 +657,11 @@ class Mingjian(Star):
             args(array[string]): 每个参数一项，按名剑指令填写。无筛选填空数组。例如「花间游的3v3前100排行」填 ["花间游","33","100"]，「梦江南的云晚归最近5场」填 ["梦江南","云晚归","5场"]。
         """
         text = normalize("NFKC", event.get_message_str().strip())
-        if not (CHAT_QUERY_TOPIC.search(text)
-                and (CHAT_QUERY_REQUEST.search(text) or BARE_ROLE_STRENGTH.fullmatch(text)
-                     or bare_rank_query(text) or bare_environment_query(text))):
-            yield "本条消息没有明确请求剑三数据。请继续原生聊天，意图不明确时可以询问用户。"
+        if CHAT_DISCUSSION.search(text):
+            yield "这条消息更像打法或评价讨论，请继续原生聊天；需要数据时再调用工具。"
+            return
+        if not CHAT_QUERY_TOPIC.search(text) and action not in ENTITY_ACTIONS:
+            yield "本条消息没有明确的剑三数据主题。请继续原生聊天，意图不明确时可以询问用户。"
             return
         if (not isinstance(action, str) or action not in QUERY_ACTIONS or not valid_chat_args(args)
                 or (action in {"名剑帮助", "名剑流程"} and args)):
