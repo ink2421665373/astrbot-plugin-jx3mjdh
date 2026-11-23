@@ -61,11 +61,11 @@ CHAT_QUERY_TOPIC = re.compile(
     r"心法|门派|配队|阵容|段位|积分|技能|阵法|走势|强度|分布|对位|配置总览|角色总览|复盘|环境|"
     r"最近[零一二三四五六七八九十两\d]+\s*场"
 )
-CHAT_DISCUSSION = re.compile(
-    r"怎么打|如何打|打法|思路|技巧|攻略|教学|手法|为什么|为啥|评价|点评|厉害|强吗|强不强|"
-    r"值得|好用|好玩|推荐吗|选哪个|哪个好|区别|怎么玩|怎么算|怎么计算|怎么定义|定义|意思|"
-    r"是什么|怎么理解|难|离谱|没用|不行|奇怪|不对"
+TALK_ONLY = re.compile(
+    r"怎么打|如何打|打法|思路|技巧|攻略|教学|手法|怎么玩|选哪个|哪个好|区别|为什么|为啥|"
+    r"评价|点评|怎么算|怎么计算|怎么定义|定义|意思|是什么|怎么理解"
 )
+OPINION_TALK = re.compile(r"厉害|强吗|强不强|值得|好用|好玩|推荐吗|难|离谱|没用|不行|奇怪|不对")
 QUERY_TOPIC_STRONG = re.compile(
     r"战绩|复盘|排行|排名|榜单|强度|环境|配队|阵容|分布|走势|奇穴|门派|技能|阵法|对位|"
     r"配置总览|角色总览|胜率|出场率|段位|积分"
@@ -164,11 +164,25 @@ def query_retry_finished(event: AstrMessageEvent) -> bool:
 
 
 def simple_role_strength_arg(text: str) -> str | None:
-    match = SIMPLE_ROLE_STRENGTH.fullmatch(normalize("NFKC", text))
-    if not match:
-        return None
-    role = match.group("role").casefold()
-    return "治疗" if role in {"奶妈", "治疗"} else "输出"
+    roles = set()
+    for part in re.split(r"[，,。;；!?！？~～…\n]+", normalize("NFKC", text)):
+        match = SIMPLE_ROLE_STRENGTH.fullmatch(part)
+        if not match:
+            continue
+        role = match.group("role").casefold()
+        roles.add("治疗" if role in {"奶妈", "治疗"} else "输出")
+    return roles.pop() if len(roles) == 1 else None
+
+
+def explicit_request(text: str) -> bool:
+    return bool(re.search(QUERY_VERB, text))
+
+
+def chat_only(text: str) -> bool:
+    """打法、定义、评价类消息，或没有查询动词的评价句。"""
+    if TALK_ONLY.search(text):
+        return True
+    return bool(OPINION_TALK.search(text)) and not explicit_request(text)
 
 
 def valid_chat_args(args: object) -> TypeGuard[list[str]]:
@@ -213,16 +227,15 @@ def query_actions(text: str) -> tuple[str, ...]:
 
 def generic_query_actions(text: str) -> tuple[str, ...]:
     """明确的数据请求但未命中专用补调时，返回可接受的 action。"""
-    if CHAT_DISCUSSION.search(text) or not QUERY_TOPIC_STRONG.search(text):
+    if chat_only(text) or not QUERY_TOPIC_STRONG.search(text):
         return ()
     actions = tuple(action for action in query_actions(text) if action in GENERIC_ACTIONS)
     if not actions:
         return ()
-    explicit = re.search(QUERY_VERB, text)
     entity = (any(heart in text for heart in RANK_CHAT_HEARTS)
               or any(server in text for server in RECORD_SERVERS)
               or bool(re.search(r"22|33|55|2v2|3v3|5v5", text, re.IGNORECASE)))
-    return actions if explicit or entity or len(re.sub(r"\s+", "", text)) <= 12 else ()
+    return actions if explicit_request(text) or entity or len(re.sub(r"\s+", "", text)) <= 12 else ()
 
 
 def selection_number(event: AstrMessageEvent) -> int | None:
@@ -523,7 +536,7 @@ class Mingjian(Star):
         text = normalize("NFKC", event.get_message_str().strip())
         tool = request.func_tool.get_tool("mingjian_query") if request.func_tool else None
         if not tool or not tool.active:
-            if CHAT_QUERY_TOPIC.search(text) and not CHAT_DISCUSSION.search(text):
+            if CHAT_QUERY_TOPIC.search(text) and not chat_only(text):
                 logger.info("名剑工具当前会话不可用，未补充查询说明；请检查人格工具权限、模型工具调用设置和唤醒方式。")
             return
         explicit_query = re.search(QUERY_VERB, text)
@@ -657,7 +670,7 @@ class Mingjian(Star):
             args(array[string]): 每个参数一项，按名剑指令填写。无筛选填空数组。例如「花间游的3v3前100排行」填 ["花间游","33","100"]，「梦江南的云晚归最近5场」填 ["梦江南","云晚归","5场"]。
         """
         text = normalize("NFKC", event.get_message_str().strip())
-        if CHAT_DISCUSSION.search(text):
+        if chat_only(text):
             yield "这条消息更像打法或评价讨论，请继续原生聊天；需要数据时再调用工具。"
             return
         if not CHAT_QUERY_TOPIC.search(text) and action not in ENTITY_ACTIONS:
