@@ -77,6 +77,7 @@ class Card:
     radar: Radar | None = None
     flow_sections: tuple[FlowSection, ...] = ()
     leaderboard_numbers: tuple[int | None, ...] = ()
+    cell_colors: dict[tuple[int, int], str] = field(default_factory=dict)
 
 
 def menu_table(menu: ChoiceMenu, *, start: int = 1) -> Table:

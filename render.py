@@ -27,6 +27,7 @@ RIGHT = WIDTH - LEFT
 BG, PAPER, INK, MUTED = "#f8f1e4", "#fdf8ef", "#282c27", "#605749"
 GREEN, ACCENT, LINE, FRAME = "#375b4b", "#913c33", "#dfd3bf", "#ad9472"
 WASH, SHADE, JADE = "#efe5d4", "#f6eee1", "#e3e8dc"
+CELL_TONES = {"win": "#2f6b45", "loss": "#a33a30", "draw": "#605749"}
 COLORS = ("#387063", "#6552a4", "#a84336", "#296b8b", "#855719",
           "#9c4c70", "#51732d", "#544e89", "#a15c32", "#247a78")
 ROOT = Path(__file__).parent
@@ -343,7 +344,7 @@ class Layout:
         if fields:
             self.y += 9
 
-    def table(self, table: Table):
+    def table(self, table: Table, colors: dict[tuple[int, int], str] | None = None):
         if table.title:
             self.heading(table.title)
         if table.caption:
@@ -360,6 +361,7 @@ class Layout:
         col_widths = [(RIGHT - LEFT) * value / total for value in weights]
         size = 17 if table.compact else 20
         padding = 8 if table.compact else 11
+        tones = colors or {}
         for number, row in enumerate([table.columns, *table.rows]):
             bold = number == 0
             boxes = [label_lines(value, length-2*padding, size, bold, keep_words=column == "指令示例", display=bold)
@@ -369,11 +371,12 @@ class Layout:
             fill = WASH if bold else (PAPER if number % 2 else SHADE)
             self.rect((LEFT, self.y, RIGHT, self.y + height), fill, outline=LINE if bold else None)
             x = LEFT
-            for value, lines, length in zip(row, boxes, col_widths):
+            for column, (value, lines, length) in enumerate(zip(row, boxes, col_widths)):
                 if isinstance(value, Sparkline):
                     self.sparkline(value, x+padding, self.y+padding, length-2*padding, height-2*padding)
                 else:
-                    self.lines(lines, x+padding, self.y+padding, size, INK, bold, display=bold)
+                    tone = INK if bold else CELL_TONES.get(tones.get((number - 1, column), ""), INK)
+                    self.lines(lines, x+padding, self.y+padding, size, tone, bold, display=bold)
                 x += length
             self.y += height
             if self.height_limit is not None and self.y > self.height_limit:
@@ -608,7 +611,7 @@ class Layout:
         if ranking and card.rows:
             self.leaderboard(card)
         elif card.columns:
-            self.table(Table("", card.columns, card.rows))
+            self.table(Table("", card.columns, card.rows), card.cell_colors)
         if card.radar:
             self.radar(card.radar)
         for table in card.tables:

@@ -10,6 +10,12 @@ from .labels import heart_icon, heart_label, label_parts, labeled, lineup_label
 from .query import REVIEW_SUMMARY, ChoiceMenu, HistoryFilter, QueryError, QueryTarget
 from .replays import ReplayView, parse_replay, replay_card
 
+RESULT_TONES = {
+    "胜": "win", "胜利": "win", "win": "win",
+    "负": "loss", "败": "loss", "失败": "loss", "lose": "loss", "loss": "loss",
+    "平": "draw", "平局": "draw", "draw": "draw",
+}
+
 
 @dataclass(frozen=True)
 class RecentMatch:
@@ -196,6 +202,11 @@ async def record(client: DataClient, origin: Role | tuple | RecordQuery) -> Card
     matches = [match for match, _ in entries]
     rows = [[str(i), match.time, match.duration, result, match.score]
             for i, (match, result) in enumerate(entries, 1)]
+    cell_colors = {}
+    for index, (_, result) in enumerate(entries):
+        tone = RESULT_TONES.get(result.strip()) or RESULT_TONES.get(result.strip().casefold())
+        if tone:
+            cell_colors[(index, 3)] = tone
     options = [(entry.label(), MatchQuery(mode, entry)) for entry in matches]
     if continuation:
         options.append(("继续查更早战绩", QueryTarget("战绩", continuation)))
@@ -211,7 +222,7 @@ async def record(client: DataClient, origin: Role | tuple | RecordQuery) -> Card
     elif not matches and has_season_matches:
         note = "已有赛季统计，暂无近期对局。"
     return Card(labeled(name, heart), subtitle, filters, ["编号", "时间", "耗时", "结果", "战后积分"], rows,
-                menu=menu, note=note)
+                menu=menu, note=note, cell_colors=cell_colors)
 
 
 async def history_page(client: DataClient, request: RecordQuery, role: Role, first: dict) -> tuple[list, RecordQuery | None]:
