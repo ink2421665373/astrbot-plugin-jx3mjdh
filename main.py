@@ -55,7 +55,7 @@ TIMING_KEY = "astrbot_plugin_mingjian.timing"
 CHAT_TOOL_USED = "astrbot_plugin_mingjian.chat_tool_used"
 QUERY_RETRY_REQUEST = "astrbot_plugin_mingjian.query_retry_request"
 QUERY_RETRY_ATTEMPTED = "astrbot_plugin_mingjian.query_retry_attempted"
-QUERY_RETRY_TIMEOUT = 15
+QUERY_RETRY_TIMEOUT = 10
 ROLE_QUERY_ACTIONS = {"战绩", "战绩复盘", "角色总览"}
 CHAT_QUERY_TOPIC = re.compile(
     r"剑(?:网)?[三3]|名剑|推栏|竞技场|战绩|对局|回放|奇穴|排行|排名|榜单|胜率|出场率|"
@@ -107,6 +107,26 @@ GENERIC_TOOL_HINT = (
     "只保留用户明确给出的参数，不要猜测角色、服务器或筛选条件。"
 )
 DIGEST_TOPICS = frozenset({"强度", "对位", "配队"})
+ACTION_COMMANDS = {
+    "战绩": "/剑三 战绩 区服 角色名",
+    "战绩复盘": "/剑三 战绩复盘 区服 角色名",
+    "角色总览": "/剑三 角色总览 区服 角色名",
+    "排行": "/剑三 排行 心法 33",
+    "强度": "/剑三 强度 输出",
+    "配置总览": "/剑三 配置总览 心法",
+    "对位": "/剑三 对位 我方心法 敌方心法",
+    "环境": "/剑三 环境 组排",
+    "配队": "/剑三 配队",
+    "分布": "/剑三 分布 33",
+    "每日走势": "/剑三 每日走势 33",
+    "门派": "/剑三 门派 万花",
+    "技能": "/剑三 技能 万花 芙蓉并蒂",
+    "阵法": "/剑三 阵法 花间游",
+    "奇穴": "/剑三 奇穴 花间游",
+    "名剑帮助": "/名剑帮助",
+    "名剑流程": "/名剑流程",
+}
+QUERY_NUDGE = "\n\n（内部提示：这是剑三数据查询，请调用 mingjian_query 工具，不要直接回答。）"
 DIGEST_TOOL_HINT = (
     "用户在讨论或评价剑网三数据。需要事实依据时调用 mingjian_digest，"
     "topic 填 强度、对位 或 配队，只取文字摘要，不要调用 mingjian_query 出图。"
@@ -353,7 +373,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.61")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.62")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -669,6 +689,10 @@ class Mingjian(Star):
                         "system": (request.system_prompt or "")[:4000],
                         "tools": ToolSet([tool]),
                     })
+        if isinstance(event.get_extra(QUERY_RETRY_REQUEST), dict):
+            prompt = (request.prompt or "").rstrip()
+            if "请调用 mingjian_query" not in prompt:
+                request.prompt = prompt + QUERY_NUDGE
 
     @filter.on_llm_response()
     async def retry_query_tool(self, event: AstrMessageEvent, response: LLMResponse | None):
@@ -776,8 +800,9 @@ class Mingjian(Star):
         elif actions == ("环境",):
             response.completion_text = "模型未成功调用名剑环境工具，没有生成环境图。可以发送 /剑三 环境 或 /剑三 环境 单排。"
         else:
+            command = ACTION_COMMANDS.get(actions[0], "/名剑帮助")
             response.completion_text = (
-                f"模型未成功调用名剑{label}工具，没有生成图卡。可以发送 /名剑帮助 查看用法。"
+                f"模型没有完成这次查询，没有生成图卡。可以发送 {command} 直接查询，或再发一次。"
             )
 
     async def _text_route(self, event: AstrMessageEvent, text: str) -> tuple[str, list[str]] | None:
