@@ -97,7 +97,13 @@ GENERIC_ACTIONS = frozenset({
 ENTITY_ACTIONS = frozenset({"技能", "门派", "阵法", "奇穴"})
 GENERIC_TOOL_HINT = (
     "用户在查询剑网三数据，请调用 mingjian_query 并选择对应 action。"
-    "可用 action：战绩、战绩复盘、角色总览、排行、强度、配置总览、对位、环境、配队、分布、每日走势、门派、技能、阵法、奇穴。"
+    "可用 action 与参数示例：战绩 [区服?, 角色名, 模式?, 场数?, 日期?]；"
+    "战绩复盘 [区服?, 角色名, 模式?, 场数?, 日期?]；角色总览 [区服?, 角色名, 模式?]；"
+    "排行 [心法?, 模式?, 范围?]；强度 [输出/治疗, 组排/单排, 2200+?]；"
+    "配置总览 [心法?, Top范围?, 治疗/输出?]；对位 [我方心法, 敌方心法?]；"
+    "环境 [组排/单排?]；配队 []；分布 [模式?, 历周走势/周内每日?]；"
+    "每日走势 [模式?]；门派 [门派或心法]；技能 [门派或心法, 技能名]；"
+    "阵法 [心法]；奇穴 [心法, 第N重?, 套路?]。"
     "只保留用户明确给出的参数，不要猜测角色、服务器或筛选条件。"
 )
 DIGEST_TOPICS = frozenset({"强度", "对位", "配队"})
@@ -347,7 +353,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.60")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.61")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -626,6 +632,7 @@ class Mingjian(Star):
                 event.set_extra(QUERY_RETRY_REQUEST, {
                     "actions": ("强度",),
                     "hint": ROLE_STRENGTH_TOOL_HINT,
+                    "system": (request.system_prompt or "")[:4000],
                     "tools": ToolSet([tool]),
                     "role_type": expected_role,
                 })
@@ -637,6 +644,7 @@ class Mingjian(Star):
                 event.set_extra(QUERY_RETRY_REQUEST, {
                     "actions": ("排行",),
                     "hint": RANK_TOOL_HINT,
+                    "system": (request.system_prompt or "")[:4000],
                     "tools": ToolSet([tool]),
                 })
         elif (ENV_TOPIC.search(text) and ENV_GAME.search(text) and not ENV_OTHER.search(text)
@@ -646,6 +654,7 @@ class Mingjian(Star):
                 event.set_extra(QUERY_RETRY_REQUEST, {
                     "actions": ("环境",),
                     "hint": ENV_TOOL_HINT,
+                    "system": (request.system_prompt or "")[:4000],
                     "tools": ToolSet([tool]),
                     "fallback": environment_args(text),
                 })
@@ -657,6 +666,7 @@ class Mingjian(Star):
                     event.set_extra(QUERY_RETRY_REQUEST, {
                         "actions": actions,
                         "hint": GENERIC_TOOL_HINT,
+                        "system": (request.system_prompt or "")[:4000],
                         "tools": ToolSet([tool]),
                     })
 
@@ -684,6 +694,7 @@ class Mingjian(Star):
         event.set_extra(QUERY_RETRY_ATTEMPTED, True)
         actions = retry_request.get("actions")
         hint = retry_request.get("hint")
+        system = retry_request.get("system") or hint
         tools = retry_request.get("tools")
         if (not isinstance(actions, tuple) or not actions
                 or any(value not in QUERY_ACTIONS for value in actions)
@@ -698,7 +709,7 @@ class Mingjian(Star):
                     return
                 retry = await self.context.llm_generate(
                     chat_provider_id=provider, prompt=event.get_message_str(), tools=tools,
-                    system_prompt=hint, tool_choice="required",
+                    system_prompt=system, tool_choice="required",
                 ) if provider else None
         except Exception as exc:
             logger.warning(f"名剑{label}工具补调失败 类型={type(exc).__name__}")
@@ -723,6 +734,7 @@ class Mingjian(Star):
                     except QueryError:
                         valid = False
                 if valid:
+                    logger.info(f"名剑工具补调成功 动作={chosen} 参数={args}")
                     async for _ in self.mingjian_query(event, chosen, args):
                         pass
                     if query_retry_finished(event):
@@ -738,6 +750,7 @@ class Mingjian(Star):
                     except QueryError:
                         valid = False
                 if valid:
+                    logger.info(f"名剑文本补调成功 动作={action} 参数={route_args}")
                     async for _ in self.mingjian_query(event, action, route_args):
                         pass
                     if query_retry_finished(event):
