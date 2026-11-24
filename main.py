@@ -99,7 +99,8 @@ GENERIC_TOOL_HINT = (
     "用户在查询剑网三数据，请调用 mingjian_query 并选择对应 action。"
     "参数示例：战绩 [\"唯我独尊\",\"云晚归\",\"33\"]；战绩复盘 [\"唯我独尊\",\"云晚归\",\"33\",\"10场\"]；"
     "角色总览 [\"唯我独尊\",\"云晚归\",\"33\"]；排行 [\"花间游\",\"33\",\"100\"]；"
-    "强度 [\"治疗\",\"组排\",\"2200+\"]（用户说 2400 以上填 \"2400+\"，说 2200-2600 填 \"2200-2600\"）；"
+    "强度 [\"治疗\",\"组排\",\"2200+\"]（用户说 2400 以上填 \"2400+\"，说 2200-2600 填 \"2200-2600\"；"
+    "说 dps/输出 填 输出，说 奶/治疗 填 治疗；用户没提组排/单排就不要填队列）；"
     "配置总览 [\"花间游\",\"Top200\",\"治疗\"]；"
     "对位 [\"花间游\",\"苍云\"]；环境 [\"组排\"]；配队 []；分布 [\"33\",\"历周走势\"]；"
     "每日走势 [\"33\",\"花间游\"]；门派 [\"万花\"]；技能 [\"万花\",\"芙蓉并蒂\"]；"
@@ -144,7 +145,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.72"
+PLUGIN_VERSION = "0.2.73"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -331,6 +332,9 @@ STRENGTH_ARG_FIXES = {
     "dps": "输出", "DPS": "输出", "奶妈": "治疗", "奶": "治疗",
     "近七天": "近7天", "近一周": "近7天", "当前周期": "当前", "全分段": "全部",
 }
+STRENGTH_ROLE_WORDS = (("dps", "输出"), ("输出", "输出"), ("伤害", "输出"),
+                       ("治疗", "治疗"), ("奶", "治疗"))
+STRENGTH_QUEUE_WORDS = (("单排", "单排"), ("散排", "单排"), ("组排", "组排"))
 
 
 def score_number(value: str) -> int | None:
@@ -389,6 +393,17 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
             fixed = [value for value in fixed
                      if not re.fullmatch(r"[0-9]{3,4}(?:\+|-?[0-9]{3,4})?", value)]
             fixed.append(score)
+        folded = text.casefold()
+        for word, role in STRENGTH_ROLE_WORDS:
+            if word in folded:
+                fixed = [value for value in fixed if value not in {"输出", "治疗"}]
+                fixed.insert(0, role)
+                break
+        for word, queue in STRENGTH_QUEUE_WORDS:
+            if word in text:
+                fixed = [value for value in fixed if value not in {"单排", "组排"}]
+                fixed.append(queue)
+                break
         return fixed
     if action == "排行":
         fixed = []
@@ -582,7 +597,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.72")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.73")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
