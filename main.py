@@ -99,7 +99,8 @@ GENERIC_TOOL_HINT = (
     "用户在查询剑网三数据，请调用 mingjian_query 并选择对应 action。"
     "参数示例：战绩 [\"唯我独尊\",\"云晚归\",\"33\"]；战绩复盘 [\"唯我独尊\",\"云晚归\",\"33\",\"10场\"]；"
     "角色总览 [\"唯我独尊\",\"云晚归\",\"33\"]；排行 [\"花间游\",\"33\",\"100\"]；"
-    "强度 [\"治疗\",\"组排\",\"2200+\"]；配置总览 [\"花间游\",\"Top200\",\"治疗\"]；"
+    "强度 [\"治疗\",\"组排\",\"2200+\"]（用户说 2400 以上填 \"2400+\"，说 2200-2600 填 \"2200-2600\"）；"
+    "配置总览 [\"花间游\",\"Top200\",\"治疗\"]；"
     "对位 [\"花间游\",\"苍云\"]；环境 [\"组排\"]；配队 []；分布 [\"33\",\"历周走势\"]；"
     "每日走势 [\"33\",\"花间游\"]；门派 [\"万花\"]；技能 [\"万花\",\"芙蓉并蒂\"]；"
     "阵法 [\"花间游\"]；奇穴 [\"花间游\"] 或 [\"花间游\",\"第8重\",\"套路=2\"]。"
@@ -143,7 +144,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.70"
+PLUGIN_VERSION = "0.2.71"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -340,6 +341,21 @@ def score_number(value: str) -> int | None:
     return None
 
 
+def text_score(text: str) -> str:
+    """从原话里提取强度分段，例如 2400以上、2200-2600、2400分。"""
+    if match := re.search(r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?(?:以上|\+)", text):
+        number = score_number(match[1])
+        return f"{number}+" if number else ""
+    if match := re.search(
+            r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*[-–到]\s*"
+            r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?", text):
+        lower, upper = score_number(match[1]), score_number(match[2])
+        return f"{lower}-{upper}" if lower and upper else ""
+    if match := re.search(r"([0-9]{3,4})\s*分", text):
+        return f"{match[1]}+"
+    return ""
+
+
 def normalize_args(action: str, args: object, text: str) -> list[str] | None:
     """把模型常见的参数写法纠正成插件能解析的形式。"""
     if not isinstance(args, list):
@@ -368,6 +384,11 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
                     value = f"{number}+"
             if value not in fixed:
                 fixed.append(value)
+        score = text_score(text)
+        if score:
+            fixed = [value for value in fixed
+                     if not re.fullmatch(r"[0-9]{3,4}(?:\+|-?[0-9]{3,4})?", value)]
+            fixed.append(score)
         return fixed
     if action == "排行":
         fixed = []
@@ -561,7 +582,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.70")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.71")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
