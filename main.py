@@ -145,7 +145,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.73"
+PLUGIN_VERSION = "0.2.74"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -597,7 +597,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.73")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.74")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)

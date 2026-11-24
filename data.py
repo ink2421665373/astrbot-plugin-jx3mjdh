@@ -15,7 +15,7 @@ from tempfile import NamedTemporaryFile
 from time import monotonic, time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from astrbot.api import logger
 
@@ -23,7 +23,7 @@ from .labels import SITE
 from .query import QueryError
 
 
-USER_AGENT = "AstrBot-Mingjian/0.2.73"
+USER_AGENT = "AstrBot-Mingjian/0.2.74"
 MAX_JSON_BYTES = 12 * 1024 * 1024
 REQUEST_GAP = 2
 DEFAULT_COOLDOWN = 60
@@ -136,8 +136,10 @@ def read_json(url: str, body: bytes | None) -> dict:
         headers["Content-Type"] = "application/json"
     request = Request(url, data=body, headers=headers)
     trace = OriginTrace()
+    # 本站始终直连：服务器上的本地代理会在 TLS 握手阶段偶发断开，且 NO_PROXY 不一定生效。
+    opener = build_opener(ProxyHandler({}), TracedHTTPSHandler(trace))
     try:
-        with build_opener(TracedHTTPSHandler(trace)).open(request, timeout=12) as response:
+        with opener.open(request, timeout=12) as response:
             final_url = urlsplit(response.geturl())
             if final_url.scheme != "https" or final_url.hostname != urlsplit(SITE).hostname:
                 raise QueryError("原站数据请求跳转到了其他站点。")
