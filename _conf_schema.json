@@ -46,8 +46,8 @@
   "natural_route_cache": {
     "type": "bool",
     "description": "复用上次的查询路由",
-    "hint": "同一会话重复同一句明确查询时，直接复用上次成功的动作和参数，不再等待模型。默认开启。",
-    "default": true
+    "hint": "开启后同一会话重复同一句明确查询会跳过模型，直接复用上次成功的动作和参数。默认关闭，保持模型调用工具。",
+    "default": false
   },
   "natural_max_calls": {
     "type": "int",
