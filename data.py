@@ -23,7 +23,7 @@ from .labels import SITE
 from .query import QueryError
 
 
-USER_AGENT = "AstrBot-Mingjian/0.2.71"
+USER_AGENT = "AstrBot-Mingjian/0.2.72"
 MAX_JSON_BYTES = 12 * 1024 * 1024
 REQUEST_GAP = 2
 DEFAULT_COOLDOWN = 60
@@ -346,11 +346,14 @@ class DataClient:
         return document, snapshot.saved_at if snapshot is not None else None
 
     async def _fetch(self, route: str, url: str, body: bytes | None, match_id: str | None) -> dict:
-        try:
-            result = await self._fetch_once(route, url, body, 1, match_id)
-        except OriginDisconnected:
-            await asyncio.sleep(REQUEST_GAP)
-            result = await self._fetch_once(route, url, body, 2, match_id)
+        for attempt in (1, 2, 3):
+            try:
+                result = await self._fetch_once(route, url, body, attempt, match_id)
+                break
+            except OriginDisconnected:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(REQUEST_GAP if attempt == 1 else REQUEST_GAP * 2)
         if route == SCHOOL_ROUTE:
             snapshot = self.school_snapshot = SchoolSnapshot(result, datetime.now(timezone.utc), self.completed)
             self.school_cache_loaded = True
