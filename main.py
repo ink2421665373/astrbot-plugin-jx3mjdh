@@ -64,9 +64,9 @@ CHAT_QUERY_TOPIC = re.compile(
 )
 TALK_ONLY = re.compile(
     r"怎么打|如何打|打法|思路|技巧|攻略|教学|手法|怎么玩|选哪个|哪个好|区别|为什么|为啥|"
-    r"评价|点评|怎么算|怎么计算|怎么定义|定义|意思|是什么|怎么理解"
+    r"评价|点评|怎么算|怎么计算|怎么定义|定义|意思|是什么|怎么理解|什么叫|什么是|啥意思|什么意思"
 )
-OPINION_TALK = re.compile(r"厉害|强吗|强不强|值得|好用|好玩|推荐吗|难|离谱|没用|不行|奇怪|不对")
+OPINION_TALK = re.compile(r"厉害|强吗|强不强|值得|好用|好玩|推荐吗|难|离谱|没用|不行|奇怪|不对|不合理")
 QUERY_TOPIC_STRONG = re.compile(
     r"战绩|复盘|排行|排名|榜单|强度|环境|配队|阵容|分布|走势|奇穴|门派|技能|阵法|对位|"
     r"配置总览|角色总览|胜率|出场率|段位|积分|帮助|流程图"
@@ -105,6 +105,8 @@ GENERIC_TOOL_HINT = (
     "对位 [\"花间游\",\"苍云\"]；环境 [\"组排\"]；配队 []；分布 [\"33\",\"历周走势\"]；"
     "每日走势 [\"33\",\"花间游\"]；门派 [\"万花\"]；技能 [\"万花\",\"芙蓉并蒂\"]；"
     "阵法 [\"花间游\"]；奇穴 [\"花间游\"] 或 [\"花间游\",\"第8重\",\"套路=2\"]。"
+    "技能必须同时给出门派和技能名；分布、走势可以直接填 2v2、3v3、5v5 或 历周走势、周内每日。"
+    "强度分段可用中文数字，「两千二以上」填 \"2200+\"；区间填 \"2200-2600\"。"
     "参数只填值，不要写 心法=、技能= 这类标签；不要猜测角色、服务器或筛选条件。"
 )
 DIGEST_TOPICS = frozenset({"强度", "对位", "配队"})
@@ -138,14 +140,18 @@ def multi_intent(text: str) -> bool:
                 and sum(1 for topic in MULTI_TOPICS if topic in text) >= 2)
 
 
-QUERY_NUDGE = "\n\n（内部提示：这是剑三数据查询，请调用 mingjian_query 工具，不要直接回答。若一次问了两件数据，请分别调用两次。）"
+QUERY_NUDGE = (
+    "\n\n（内部提示：这是剑三数据查询，必须调用 mingjian_query 工具，禁止用 search_meme_wiki、"
+    "astr_kb_search、web_search 等工具确认游戏术语，也不要直接文字回答。"
+    "若一次问了两件数据，请分别调用两次 mingjian_query。）"
+)
 DIGEST_TOOL_HINT = (
     "用户在讨论或评价剑网三数据。需要事实依据时调用 mingjian_digest，"
     "topic 填 强度、对位 或 配队，只取文字摘要，不要调用 mingjian_query 出图。"
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.75"
+PLUGIN_VERSION = "0.2.76"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -352,7 +358,7 @@ def text_score(text: str) -> str:
         number = score_number(match[1])
         return f"{number}+" if number else ""
     if match := re.search(
-            r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*[-–到]\s*"
+            r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?\s*[-–到]\s*"
             r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?", text):
         lower, upper = score_number(match[1]), score_number(match[2])
         return f"{lower}-{upper}" if lower and upper else ""
@@ -378,7 +384,7 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
                 if number:
                     value = f"{number}+"
             elif match := re.fullmatch(
-                    r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*[-–到]\s*"
+                    r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?\s*[-–到]\s*"
                     r"([0-9]{3,4}|[一二三四五六七八九十百千两]+)\s*分?", value):
                 lower, upper = score_number(match[1]), score_number(match[2])
                 if lower and upper:
@@ -392,7 +398,7 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
         score = text_score(text)
         if score:
             fixed = [value for value in fixed
-                     if not re.fullmatch(r"[0-9]{3,4}(?:\+|-?[0-9]{3,4})?", value)]
+                     if not re.fullmatch(r"[0-9]{3,4}(?:\+|-[0-9]{3,4}|-)?", value)]
             fixed.append(score)
         folded = text.casefold()
         for word, role in STRENGTH_ROLE_WORDS:
@@ -409,6 +415,10 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
     if action == "排行":
         fixed = []
         for value in values:
+            for prefix in ("剑网三", "名剑", "剑三", "竞技场", "推栏", "pvp", "jjc"):
+                if value.casefold().startswith(prefix.casefold()) and len(value) > len(prefix):
+                    value = value[len(prefix):].strip()
+                    break
             if value in {"名剑", "竞技场", "推栏", "pvp", "PVP", "jjc", "JJC"}:
                 continue
             if match := re.fullmatch(r"前?([0-9]+|[一二三四五六七八九十百千两]+)\s*名?", value):
@@ -422,8 +432,10 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
         # 配队查询不接受任何筛选，模型常把心法名塞进来。
         return []
     if action == "配置总览":
-        fixed = []
+        fixed = ["检索"] if "检索" in values else []
         for value in values:
+            if value == "检索":
+                continue
             if match := re.fullmatch(r"前?\s*([0-9]{1,4}|[一二三四五六七八九十百千两]+)", value):
                 number = score_number(match[1])
                 if number in {50, 200, 1000}:
@@ -612,7 +624,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.75")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.76")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -953,7 +965,8 @@ class Mingjian(Star):
         explicit_query = re.search(QUERY_VERB, text)
         ready = (not event.get_extra(QUERY_RETRY_ATTEMPTED)
                  and not query_retry_finished(event))
-        if ROLE_STRENGTH_TOPIC.search(text) and (explicit_query or BARE_ROLE_STRENGTH.fullmatch(text)):
+        if (ROLE_STRENGTH_TOPIC.search(text) and not chat_only(text)
+                and strength_role(text) is not None):
             request.system_prompt += "\n\n" + ROLE_STRENGTH_TOOL_HINT
             expected_role = strength_role(text)
             if expected_role and ready:
@@ -964,7 +977,8 @@ class Mingjian(Star):
                     "tools": ToolSet([tool]),
                     "role_type": expected_role,
                 })
-        elif ((explicit_query or bare_rank_query(text))
+        elif ((explicit_query or bare_rank_query(text)
+               or re.search(r"(?:22|33|55|2v2|3v3|5v5)", text, re.IGNORECASE))
               and RANK_CHAT_TOPIC.search(text) and not RANK_CHAT_OTHER_TOPIC.search(text)
               and (RANK_CHAT_GAME.search(text) or any(heart in text for heart in RANK_CHAT_HEARTS)
                    or any(server in text for server in RECORD_SERVERS))):
@@ -976,8 +990,7 @@ class Mingjian(Star):
                     "system": (request.system_prompt or "")[:4000],
                     "tools": ToolSet([tool]),
                 })
-        elif (ENV_TOPIC.search(text) and ENV_GAME.search(text) and not ENV_OTHER.search(text)
-              and (explicit_query or bare_environment_query(text))):
+        elif ENV_TOPIC.search(text) and ENV_GAME.search(text) and not ENV_OTHER.search(text):
             request.system_prompt += "\n\n" + ENV_TOOL_HINT
             if ready:
                 event.set_extra(QUERY_RETRY_REQUEST, {
