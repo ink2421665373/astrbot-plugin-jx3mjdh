@@ -151,7 +151,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.76"
+PLUGIN_VERSION = "0.2.77"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -624,7 +624,41 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.76")
+BARE_COMMAND_ACTIONS = {
+    "战绩复盘": "战绩复盘", "多场复盘": "战绩复盘", "多场战绩复盘": "战绩复盘",
+    "复盘": "战绩复盘", "角色总览": "角色总览", "配置总览": "配置总览",
+    "名剑帮助": "名剑帮助", "名剑流程": "名剑流程", "名剑诊断": "名剑诊断",
+    "每日走势": "每日走势", "战绩": "战绩", "排行": "排行", "强度": "强度",
+    "环境": "环境", "对位": "对位", "配队": "配队", "分布": "分布",
+    "门派": "门派", "技能": "技能", "阵法": "阵法", "奇穴": "奇穴",
+}
+BARE_COMMAND_CHAT = re.compile(r"怎么|如何|什么|吗|么|？|\?")
+
+
+def bare_command_args(event: AstrMessageEvent) -> tuple[str, list[str]] | None:
+    """不带 / 和 @ 的指令式消息，例如「强度 输出」「战绩 唯满侠 双绛」。"""
+    text = normalize("NFKC", event.get_message_str().strip())
+    if not text or text.startswith("/") or BARE_COMMAND_CHAT.search(text):
+        return None
+    if re.match(r"^(?:剑三|名剑)\s+", text):
+        return None
+    if direct_record_args(event) is not None:
+        return None
+    parts = text.split(maxsplit=1)
+    action = BARE_COMMAND_ACTIONS.get(parts[0])
+    if action is None:
+        return None
+    rest = parts[1].strip() if len(parts) == 2 else ""
+    args = [match[1] or match[2] for match in re.finditer(r'"([^"]+)"(?=\s|$)|(\S+)', rest)]
+    return action, args
+
+
+class BareCommand(filter.CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        return bare_command_args(event) is not None
+
+
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.77")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -908,6 +942,31 @@ class Mingjian(Star):
         text = command[1].strip() if len(command) == 2 else ""
         async for result in self._execute(event, "名剑", [], utterance=text):
             yield result
+
+    @filter.custom_filter(BareCommand, priority=90)
+    async def bare_command(self, event: AstrMessageEvent):
+        """无 / 无 @ 的明确指令，直接走非 LLM 查询。"""
+        parsed = bare_command_args(event)
+        if parsed is None:
+            return
+        action, args = parsed
+        event.stop_event()
+        if action in {"名剑帮助", "名剑流程"}:
+            card = help_card() if action == "名剑帮助" else flow_card()
+            yield await self._guide_result(event, card, QueryTiming(action))
+            return
+        if action == "名剑诊断":
+            async for response in self.diagnose(event):
+                yield response
+            return
+        sent = False
+        async for response in self._execute(event, action, args):
+            timing = event.get_extra(TIMING_KEY)
+            event.set_extra(TIMING_KEY, None)
+            await self._send_timed(event, response, timing)
+            sent = True
+        if sent:
+            remember_query(event, event.get_message_str().strip(), action)
 
     @filter.custom_filter(DirectRecord, priority=100)
     async def direct_record(self, event: AstrMessageEvent):
