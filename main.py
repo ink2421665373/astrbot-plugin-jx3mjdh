@@ -145,7 +145,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.74"
+PLUGIN_VERSION = "0.2.75"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -190,6 +190,7 @@ RANK_CHAT_HEARTS = frozenset(HEART_NAMES) | frozenset(HEART_NAMES.values())
 RANK_TOOL_HINT = (
     "用户明确要求查询名剑玩家排行榜或发送榜单图时，调用 mingjian_query，action 填排行。"
     "例如「帮我查剑三花间游的 3v3 排行榜，发榜单图」的 args 为 [\"花间游\",\"33\"]。"
+    "梦江南、唯我独尊、唯满侠等是剑三服务器名，不是梗百科词条；「查一下梦江南的排行榜」的 args 为 [\"梦江南\"]。"
     "图卡会由工具发送；只有工具返回后才可确认查询结果。"
 )
 BARE_RANK = re.compile(
@@ -417,6 +418,20 @@ def normalize_args(action: str, args: object, text: str) -> list[str] | None:
             if value not in fixed:
                 fixed.append(value)
         return fixed
+    if action == "配队":
+        # 配队查询不接受任何筛选，模型常把心法名塞进来。
+        return []
+    if action == "配置总览":
+        fixed = []
+        for value in values:
+            if match := re.fullmatch(r"前?\s*([0-9]{1,4}|[一二三四五六七八九十百千两]+)", value):
+                number = score_number(match[1])
+                if number in {50, 200, 1000}:
+                    value = f"Top{number}"
+            value = {"DPS": "输出", "dps": "输出", "奶妈": "治疗"}.get(value, value)
+            if value and value not in fixed:
+                fixed.append(value)
+        return fixed
     if action in ROLE_QUERY_ACTIONS:
         fixed = []
         for value in values:
@@ -597,7 +612,7 @@ class DirectRecord(filter.CustomFilter):
         return direct_record_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.74")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.75")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -951,7 +966,8 @@ class Mingjian(Star):
                 })
         elif ((explicit_query or bare_rank_query(text))
               and RANK_CHAT_TOPIC.search(text) and not RANK_CHAT_OTHER_TOPIC.search(text)
-              and (RANK_CHAT_GAME.search(text) or any(heart in text for heart in RANK_CHAT_HEARTS))):
+              and (RANK_CHAT_GAME.search(text) or any(heart in text for heart in RANK_CHAT_HEARTS)
+                   or any(server in text for server in RECORD_SERVERS))):
             request.system_prompt += "\n\n" + RANK_TOOL_HINT
             if ready:
                 event.set_extra(QUERY_RETRY_REQUEST, {
@@ -1217,8 +1233,12 @@ class Mingjian(Star):
             yield "这条消息更像打法或评价讨论，请继续原生聊天；需要数据时再调用工具。"
             return
         if not CHAT_QUERY_TOPIC.search(text) and action not in ENTITY_ACTIONS:
-            yield "本条消息没有明确的剑三数据主题。请继续原生聊天，意图不明确时可以询问用户。"
-            return
+            recent = RECENT_QUERY.get(chat_key(event))
+            follow_up = bool(follow_up_entity(text, self.aliases) and recent
+                             and monotonic() - recent[1] <= 120)
+            if not follow_up:
+                yield "本条消息没有明确的剑三数据主题。请继续原生聊天，意图不明确时可以询问用户。"
+                return
         if (not isinstance(action, str) or action not in QUERY_ACTIONS or not valid_chat_args(args)
                 or (action in {"名剑帮助", "名剑流程"} and args)):
             yield "名剑查询参数无效，请按工具说明提供一个受支持的操作和参数数组。"
