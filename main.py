@@ -199,7 +199,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.79"
+PLUGIN_VERSION = "0.2.80"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -706,7 +706,7 @@ class BareCommand(filter.CustomFilter):
         return bare_command_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.79")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.80")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -1133,6 +1133,9 @@ class Mingjian(Star):
             prompt = (request.prompt or "").rstrip()
             if "请调用 mingjian_query" not in prompt:
                 request.prompt = prompt + QUERY_NUDGE
+            # 明确的数据查询只保留名剑查询工具，避免模型改用梗百科或联网搜索。
+            if isinstance(request.func_tool, ToolSet):
+                request.func_tool = ToolSet([tool])
 
     @filter.on_llm_response()
     async def retry_query_tool(self, event: AstrMessageEvent, response: LLMResponse | None):

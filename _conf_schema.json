@@ -28,8 +28,8 @@
   "natural_retry_timeout": {
     "type": "int",
     "description": "补调等待（秒）",
-    "hint": "补调和文本路由最多等待模型的时间，填写 1–60 秒，默认 10 秒。",
-    "default": 10
+    "hint": "补调和文本路由最多等待模型的时间，填写 1–180 秒，默认 90 秒。模型较慢时不要低于 60 秒。",
+    "default": 90
   },
   "natural_text_route_enabled": {
     "type": "bool",

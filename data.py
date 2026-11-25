@@ -1,21 +1,26 @@
 import asyncio
+import base64
+import hashlib
 import json
+import secrets
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from functools import partial
 from http.client import HTTPSConnection, IncompleteRead
+from http.cookiejar import CookieJar
 from math import ceil
 from os import fsync
 from pathlib import Path
 from socket import gaierror
 from ssl import SSLCertVerificationError, SSLEOFError
 from tempfile import NamedTemporaryFile
+from threading import Lock
 from time import monotonic, time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPCookieProcessor, HTTPSHandler, ProxyHandler, Request, build_opener
 
 from astrbot.api import logger
 
@@ -23,7 +28,7 @@ from .labels import SITE
 from .query import QueryError
 
 
-USER_AGENT = "AstrBot-Mingjian/0.2.79"
+USER_AGENT = "AstrBot-Mingjian/0.2.80"
 MAX_JSON_BYTES = 12 * 1024 * 1024
 REQUEST_GAP = 2
 DEFAULT_COOLDOWN = 60
@@ -130,49 +135,195 @@ def retry_delay(value: str) -> float:
         return 0
 
 
-def read_json(url: str, body: bytes | None) -> dict:
+class ClientProof:
+    """原站 ESA 客户端证明：取 token 并给每个 API 请求生成签名头。"""
+
+    ROUTE = "client-proof"
+    REFRESH_MARGIN = 60
+    RETRY_AFTER_FAILURE = 30.0
+    DEFAULT_HEADERS = {
+        "token": "x-client-proof-token",
+        "timestamp": "x-client-proof-ts",
+        "nonce": "x-client-proof-nonce",
+        "proof": "x-client-proof",
+        "kid": "x-client-proof-kid",
+        "daily": "x-client-proof-daily",
+        "bodyHash": "x-client-proof-body",
+    }
+
+    def __init__(self):
+        self.jar = CookieJar()
+        self.lock = Lock()
+        self.token = ""
+        self.expires_at = 0
+        self.kid = ""
+        self.daily_salt = ""
+        self.aliases: dict[str, str] = {}
+        self.clock_offset_ms = 0
+        self.unavailable_until = 0.0
+
+    def invalidate(self):
+        with self.lock:
+            self.token = ""
+            self.expires_at = 0
+
+    def _now_ms(self) -> int:
+        return int(time() * 1000) + self.clock_offset_ms
+
+    def _valid_locked(self) -> bool:
+        return bool(self.token) and self.expires_at - int(self._now_ms() / 1000) > self.REFRESH_MARGIN
+
+    def _fetch_locked(self):
+        started = int(time() * 1000)
+        opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(self.jar))
+        request = Request(SITE + "api/" + self.ROUTE,
+                          headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+        with opener.open(request, timeout=12) as response:
+            document = json.loads(response.read(MAX_JSON_BYTES))
+        ended = int(time() * 1000)
+        if not isinstance(document, dict):
+            raise ValueError("proof response is not an object")
+        token = document.get("token")
+        expires_at = document.get("expiresAt")
+        if not isinstance(token, str) or not token or not isinstance(expires_at, (int, float)):
+            raise ValueError("proof response is missing token")
+        aliases = document.get("headerAliases")
+        clean = {}
+        if isinstance(aliases, dict):
+            for name in self.DEFAULT_HEADERS:
+                value = aliases.get(name)
+                if isinstance(value, str) and value.lower().startswith("x-"):
+                    clean[name] = value.lower()
+        self.token = token
+        self.expires_at = int(expires_at)
+        self.kid = document.get("kid") if isinstance(document.get("kid"), str) else ""
+        self.daily_salt = document.get("dailySalt") if isinstance(document.get("dailySalt"), str) else ""
+        self.aliases = clean
+        server_ms = document.get("serverTimeMs")
+        if isinstance(server_ms, (int, float)) and server_ms > 0:
+            self.clock_offset_ms = int(server_ms - (started + ended) / 2)
+
+    def _ensure_locked(self) -> bool:
+        if self._valid_locked():
+            return True
+        if monotonic() < self.unavailable_until:
+            return False
+        try:
+            self._fetch_locked()
+        except Exception as exc:
+            self.token = ""
+            self.unavailable_until = monotonic() + self.RETRY_AFTER_FAILURE
+            logger.warning(f"名剑获取原站安全证明失败 类型={error_kind(exc)}")
+            return False
+        return bool(self.token)
+
+    def _alias(self, name: str) -> str:
+        return self.aliases.get(name) or self.DEFAULT_HEADERS[name]
+
+    def _encrypt(self, method: str, path: str, timestamp: str, nonce: str, daily: str,
+                 body: bytes) -> tuple[bytes, str]:
+        canonical = f"{method}:{path}:{timestamp}:{nonce}:{self.token}{daily}"
+        stream = bytearray()
+        index = 0
+        while len(stream) < len(body):
+            stream.extend(hashlib.sha256(f"enc:{canonical}:{index}".encode()).digest())
+            index += 1
+        cipher = bytes(value ^ stream[position] for position, value in enumerate(body))
+        encoded = base64.urlsafe_b64encode(cipher).rstrip(b"=").decode("ascii")
+        check = hashlib.sha256(f"check:{canonical}:{encoded}".encode()).hexdigest()
+        envelope = json.dumps({"v": 1, "p": encoded, "c": check},
+                              ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return envelope, hashlib.sha256(envelope).hexdigest()
+
+    def sign(self, method: str, path: str, body: bytes | None) -> tuple[dict[str, str] | None, bytes | None]:
+        with self.lock:
+            if not self._ensure_locked():
+                return None, body
+            timestamp = str(int(self._now_ms() / 1000))
+            nonce = secrets.token_hex(12)
+            daily = f":{self.kid}:{self.daily_salt}" if self.kid and self.daily_salt else ""
+            if body is None:
+                send, body_hash, extra = None, hashlib.sha256(b"").hexdigest(), {}
+            else:
+                send, body_hash = self._encrypt(method, path, timestamp, nonce, daily, body)
+                extra = {"x-request-body-encoding": "jx3-v1"}
+            canonical = f"{method}:{path}:{timestamp}:{nonce}:{self.token}:{body_hash}{daily}"
+            headers = {
+                self._alias("token"): self.token,
+                self._alias("timestamp"): timestamp,
+                self._alias("nonce"): nonce,
+                self._alias("proof"): hashlib.sha256(canonical.encode()).hexdigest(),
+                self._alias("bodyHash"): body_hash,
+            }
+            if daily:
+                headers[self._alias("kid")] = self.kid
+                headers[self._alias("daily")] = self.daily_salt
+            headers.update(extra)
+            return headers, send
+
+
+def read_json(url: str, body: bytes | None, proof: ClientProof | None = None) -> dict:
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if body is not None:
         headers["Content-Type"] = "application/json"
-    request = Request(url, data=body, headers=headers)
-    trace = OriginTrace()
-    # 本站始终直连：服务器上的本地代理会在 TLS 握手阶段偶发断开，且 NO_PROXY 不一定生效。
-    opener = build_opener(ProxyHandler({}), TracedHTTPSHandler(trace))
-    try:
-        with opener.open(request, timeout=12) as response:
-            final_url = urlsplit(response.geturl())
-            if final_url.scheme != "https" or final_url.hostname != urlsplit(SITE).hostname:
-                raise QueryError("原站数据请求跳转到了其他站点。")
-            trace.stage = "读取HTTP响应体"
-            content = response.read(MAX_JSON_BYTES + 1)
-            response_headers = getattr(response, "headers", None) or {}
-            size = response_headers.get("Content-Length", "").strip()
-            if (len(content) <= MAX_JSON_BYTES and response_headers.get("Transfer-Encoding", "").lower() != "chunked"
-                    and len(size) <= 18 and size.isascii() and size.isdecimal()):
-                remaining = int(size) - len(content)
-                if remaining > 0:
-                    raise IncompleteRead(content, remaining)
-    except HTTPError as exc:
-        with exc:
-            details = None
-            if exc.code in (400, 404, 409, 422):
-                try:
-                    details = json.loads(exc.read(128 * 1024))
-                except (ValueError, OSError, IncompleteRead):
-                    pass
-            delay = retry_delay(exc.headers.get("Retry-After") or "") if exc.code == 429 and exc.headers else 0
-            raise ApiError(exc.code, details, delay) from None
-    except (OSError, IncompleteRead) as exc:
-        cause = exc.reason if isinstance(exc, URLError) else exc
-        if isinstance(cause, gaierror):
-            trace.stage = "DNS解析"
-        if isinstance(cause, (SSLEOFError, ConnectionResetError, ConnectionAbortedError, IncompleteRead)):
-            raise OriginDisconnected("与原站的连接中途断开，请稍后再试。", trace) from exc
-        if isinstance(cause, SSLCertVerificationError):
-            raise QueryError("无法校验原站 HTTPS 证书，请检查 AstrBot 所在环境的证书和代理。") from exc
-        if isinstance(cause, TimeoutError):
-            raise OriginUnavailable("请求原站超时，请稍后再试。", trace) from exc
-        raise OriginUnavailable("连不上原站数据，请检查 AstrBot 的网络后再试。", trace) from exc
+    method = "GET" if body is None else "POST"
+    split = urlsplit(url)
+    path = split.path + (f"?{split.query}" if split.query else "")
+    for attempt in (1, 2):
+        trace = OriginTrace()
+        send_body = body
+        request_headers = dict(headers)
+        if proof is not None:
+            signed, send_body = proof.sign(method, path, body)
+            if signed is None:
+                raise QueryError("原站安全校验暂不可用，请稍后再试。")
+            request_headers.update(signed)
+        request = Request(url, data=send_body, headers=request_headers)
+        # 本站始终直连：服务器上的本地代理会在 TLS 握手阶段偶发断开，且 NO_PROXY 不一定生效。
+        opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(proof.jar if proof else CookieJar()),
+                              TracedHTTPSHandler(trace))
+        try:
+            with opener.open(request, timeout=12) as response:
+                final_url = urlsplit(response.geturl())
+                if final_url.scheme != "https" or final_url.hostname != urlsplit(SITE).hostname:
+                    raise QueryError("原站数据请求跳转到了其他站点。")
+                trace.stage = "读取HTTP响应体"
+                content = response.read(MAX_JSON_BYTES + 1)
+                response_headers = getattr(response, "headers", None) or {}
+                size = response_headers.get("Content-Length", "").strip()
+                if (len(content) <= MAX_JSON_BYTES
+                        and response_headers.get("Transfer-Encoding", "").lower() != "chunked"
+                        and len(size) <= 18 and size.isascii() and size.isdecimal()):
+                    remaining = int(size) - len(content)
+                    if remaining > 0:
+                        raise IncompleteRead(content, remaining)
+            break
+        except HTTPError as exc:
+            refresh = (exc.headers.get("x-client-proof-refresh") or "").strip() if exc.headers else ""
+            if attempt == 1 and proof is not None and exc.code == 403 and refresh == "1":
+                exc.close()
+                proof.invalidate()
+                continue
+            with exc:
+                details = None
+                if exc.code in (400, 404, 409, 422):
+                    try:
+                        details = json.loads(exc.read(128 * 1024))
+                    except (ValueError, OSError, IncompleteRead):
+                        pass
+                delay = retry_delay(exc.headers.get("Retry-After") or "") if exc.code == 429 and exc.headers else 0
+                raise ApiError(exc.code, details, delay) from None
+        except (OSError, IncompleteRead) as exc:
+            cause = exc.reason if isinstance(exc, URLError) else exc
+            if isinstance(cause, gaierror):
+                trace.stage = "DNS解析"
+            if isinstance(cause, (SSLEOFError, ConnectionResetError, ConnectionAbortedError, IncompleteRead)):
+                raise OriginDisconnected("与原站的连接中途断开，请稍后再试。", trace) from exc
+            if isinstance(cause, SSLCertVerificationError):
+                raise QueryError("无法校验原站 HTTPS 证书，请检查 AstrBot 所在环境的证书和代理。") from exc
+            if isinstance(cause, TimeoutError):
+                raise OriginUnavailable("请求原站超时，请稍后再试。", trace) from exc
+            raise OriginUnavailable("连不上原站数据，请检查 AstrBot 的网络后再试。", trace) from exc
     if len(content) > MAX_JSON_BYTES:
         raise QueryError("原站返回的数据太大，暂时无法出图。")
     try:
@@ -272,6 +423,7 @@ class DataClient:
     def __init__(self, school_cache_path: Path | None = None):
         self.cache = OrderedDict()
         self.lock = asyncio.Lock()
+        self.proof = ClientProof()
         self.completed = 0.0
         self.limited_until = 0.0
         self.inflight: asyncio.Task[dict] | None = None
@@ -372,7 +524,7 @@ class DataClient:
     async def _fetch_once(self, route: str, url: str, body: bytes | None, attempt: int, match_id: str | None) -> dict:
         started = monotonic()
         try:
-            result = await asyncio.to_thread(read_json, url, body)
+            result = await asyncio.to_thread(read_json, url, body, self.proof)
             if route == SCHOOL_ROUTE and not valid_school_document(result):
                 raise QueryError("原站暂未返回可用的门派资料。")
             if route == RANK_TAGS_ROUTE and not valid_rank_tags(result):
