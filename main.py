@@ -55,7 +55,7 @@ TIMING_KEY = "astrbot_plugin_mingjian.timing"
 CHAT_TOOL_USED = "astrbot_plugin_mingjian.chat_tool_used"
 QUERY_RETRY_REQUEST = "astrbot_plugin_mingjian.query_retry_request"
 QUERY_RETRY_ATTEMPTED = "astrbot_plugin_mingjian.query_retry_attempted"
-QUERY_RETRY_TIMEOUT = 10
+QUERY_RETRY_TIMEOUT = 90
 ROLE_QUERY_ACTIONS = {"战绩", "战绩复盘", "角色总览"}
 CHAT_QUERY_TOPIC = re.compile(
     r"剑(?:网)?[三3]|名剑|推栏|竞技场|战绩|对局|回放|奇穴|排行|排名|榜单|胜率|出场率|"
@@ -129,6 +129,35 @@ ACTION_COMMANDS = {
     "名剑帮助": "/名剑帮助",
     "名剑流程": "/名剑流程",
 }
+ACTION_ALIASES = {
+    "排行榜": "排行", "排名": "排行", "榜单": "排行", "排行版": "排行", "排行查询": "排行",
+    "强度榜": "强度", "强度排行": "强度", "心法强度": "强度", "心法强度榜": "强度",
+    "心法强度排行": "强度", "战绩查询": "战绩", "角色战绩": "战绩",
+    "复盘": "战绩复盘", "多场复盘": "战绩复盘", "多场战绩复盘": "战绩复盘",
+    "角色详情": "角色总览", "角色信息": "角色总览",
+    "配置": "配置总览", "配置统计": "配置总览",
+    "对战": "对位", "克制": "对位", "对位查询": "对位",
+    "队伍": "配队", "阵容": "配队", "配队查询": "配队",
+    "环境分析": "环境", "pvp环境": "环境", "PVP环境": "环境",
+    "分布统计": "分布", "走势": "每日走势", "每日趋势": "每日走势", "趋势": "每日走势",
+    "门派资料": "门派", "心法资料": "门派", "技能查询": "技能",
+    "奇穴图谱": "奇穴", "奇穴方案": "奇穴",
+    "帮助": "名剑帮助", "流程": "名剑流程",
+}
+
+
+def canonical_action(action: object) -> str:
+    """把模型常用的近义动作名归一成插件支持的 action。"""
+    if not isinstance(action, str):
+        return ""
+    value = normalize("NFKC", action).strip()
+    if value in ACTION_ALIASES:
+        return ACTION_ALIASES[value]
+    for suffix, target in (("强度排行榜", "强度"), ("强度排行", "强度"), ("强度榜", "强度"),
+                           ("排行榜", "排行")):
+        if value.endswith(suffix):
+            return target
+    return value
 MULTI_SEPARATOR = re.compile(r"和|以及|还有|顺便|、|,")
 MULTI_TOPICS = ("战绩", "复盘", "角色总览", "排行", "强度", "配置总览", "对位", "环境",
                 "配队", "分布", "每日走势", "门派", "技能", "阵法", "奇穴")
@@ -151,7 +180,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.77"
+PLUGIN_VERSION = "0.2.78"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -658,7 +687,7 @@ class BareCommand(filter.CustomFilter):
         return bare_command_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.77")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.78")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -1129,8 +1158,10 @@ class Mingjian(Star):
             pass
         retry = None
         if self.natural.retry_enabled:
+            retry_budget = min(self.natural.timeout_seconds, self.natural.retry_timeout)
+            retry_started = monotonic()
             try:
-                async with asyncio.timeout(min(self.natural.timeout_seconds, self.natural.retry_timeout)):
+                async with asyncio.timeout(retry_budget):
                     provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
                     if query_retry_finished(event):
                         return
@@ -1139,7 +1170,10 @@ class Mingjian(Star):
                         system_prompt=system, tool_choice="required",
                     ) if provider else None
             except Exception as exc:
-                logger.warning(f"名剑{label}工具补调失败 类型={type(exc).__name__}")
+                logger.warning(
+                    f"名剑{label}工具补调失败 类型={type(exc).__name__} "
+                    f"等待={monotonic() - retry_started:.1f}s 上限={retry_budget}s"
+                )
                 LAST_ERROR[chat_key(event)] = (type(exc).__name__, monotonic())
                 retry = None
         if query_retry_finished(event):
@@ -1147,7 +1181,7 @@ class Mingjian(Star):
         if (retry and retry.role in {"assistant", "tool"} and retry.tools_call_name == ["mingjian_query"]
                 and len(retry.tools_call_args or []) == 1):
             tool_call = retry.tools_call_args[0]
-            chosen = tool_call.get("action") if isinstance(tool_call, dict) else None
+            chosen = canonical_action(tool_call.get("action")) if isinstance(tool_call, dict) else ""
             args = normalize_args(chosen or "",
                                   tool_call.get("args") if isinstance(tool_call, dict) else None, text)
             if chosen in actions and args is not None and valid_chat_args(args):
@@ -1203,33 +1237,46 @@ class Mingjian(Star):
         response.result_chain = None
         if actions == ("强度",):
             response.completion_text = (
-                "模型未成功调用名剑心法强度工具，没有生成强度图。可以发送 /剑三 强度 或 /剑三 强度 治疗。"
+                "模型没有在限定时间内完成心法强度查询，没有生成强度图。"
+                "可以直接发送「强度 输出」或「/剑三 强度 治疗」。"
             )
         elif actions == ("排行",):
-            response.completion_text = "模型未成功调用名剑排行榜工具，没有生成榜单图。可以发送 /剑三 排行。"
+            response.completion_text = (
+                "模型没有在限定时间内完成排行榜查询，没有生成榜单图。"
+                "可以直接发送「排行 气纯」或「/剑三 排行」。"
+            )
         elif actions == ("环境",):
-            response.completion_text = "模型未成功调用名剑环境工具，没有生成环境图。可以发送 /剑三 环境 或 /剑三 环境 单排。"
+            response.completion_text = (
+                "模型没有在限定时间内完成环境查询，没有生成环境图。"
+                "可以直接发送「环境 组排」或「/剑三 环境 单排」。"
+            )
         else:
             command = ACTION_COMMANDS.get(actions[0], "/名剑帮助")
             response.completion_text = (
-                f"模型没有完成这次查询，没有生成图卡。可以发送 {command} 直接查询，或再发一次。"
+                f"模型没有完成这次查询，没有生成图卡。"
+                f"可以直接发送「{actions[0]}」开头的指令、{command}，或再发一次。"
             )
 
     async def _text_route(self, event: AstrMessageEvent, text: str) -> tuple[str, list[str]] | None:
         """工具调用失败后，用普通文本 JSON 再解析一次意图，覆盖全部动作。"""
+        started = monotonic()
+        budget = min(self.natural.timeout_seconds, QUERY_RETRY_TIMEOUT)
         try:
             provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
             if not provider:
                 return None
             date = datetime.now(CHINA_TIME).date().isoformat()
-            async with asyncio.timeout(min(self.natural.timeout_seconds, QUERY_RETRY_TIMEOUT)):
+            async with asyncio.timeout(budget):
                 response = await self.context.llm_generate(
                     chat_provider_id=provider,
                     prompt=f"北京时间日期 {date}\n用户原话\n{route_prompt(event, text)}",
                     system_prompt=NATURAL_SYSTEM_PROMPT,
                 )
         except Exception as exc:
-            logger.warning(f"名剑文本补调失败 类型={type(exc).__name__}")
+            logger.warning(
+                f"名剑文本补调失败 类型={type(exc).__name__} "
+                f"等待={monotonic() - started:.1f}s 上限={budget}s"
+            )
             LAST_ERROR[chat_key(event)] = (type(exc).__name__, monotonic())
             return None
         try:
@@ -1300,6 +1347,7 @@ class Mingjian(Star):
             args(array[string]): 每个参数一项，按名剑指令填写。无筛选填空数组。例如「花间游的3v3前100排行」填 ["花间游","33","100"]，「梦江南的云晚归最近5场」填 ["梦江南","云晚归","5场"]。
         """
         text = normalize("NFKC", event.get_message_str().strip())
+        action = canonical_action(action)
         logger.info(f"名剑工具调用 操作={action} 参数={args}")
         if chat_only(text):
             yield "这条消息更像打法或评价讨论，请继续原生聊天；需要数据时再调用工具。"

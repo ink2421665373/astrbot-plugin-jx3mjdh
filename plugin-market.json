@@ -8,7 +8,7 @@
     "author": "Codex",
     "name": "astrbot_plugin_mingjian",
     "display_name": "名剑查询",
-    "version": "v0.2.77",
+    "version": "v0.2.78",
     "repo": "https://github.com/ink2421665373/astrbot-plugin-jx3mjdh",
     "desc": "通过剑网三 PVP 查询站的公开数据查询战绩、榜单、强度和门派资料。",
     "astrbot_version": ">=4.16,<5"

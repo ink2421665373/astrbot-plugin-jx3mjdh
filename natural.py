@@ -24,6 +24,8 @@ JSON_FENCE = re.compile(r"\A\`\`\`(?:json)?[ \t]*\r?\n(.*?)\r?\n\`\`\`\Z", re.DO
 CHINA_TIME = timezone(timedelta(hours=8))
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 300
+DEFAULT_RETRY_SECONDS = 90
+MAX_RETRY_SECONDS = 180
 GUIDE_ACTIONS = frozenset({"名剑帮助", "名剑流程"})
 HELP_REQUEST = re.compile(r"帮助|指令示例|用法|参数说明|默认值")
 FLOW_REQUEST = re.compile(r"流程|链路|操作分支|菜单分支")
@@ -185,7 +187,9 @@ class NaturalLanguage:
         self.retry_enabled = settings.get("natural_retry_enabled") is not False
         self.text_route_enabled = settings.get("natural_text_route_enabled") is not False
         retry = settings.get("natural_retry_timeout")
-        self.retry_timeout = retry if type(retry) is int and 1 <= retry <= 60 else 10
+        self.retry_timeout = (
+            retry if type(retry) is int and 1 <= retry <= MAX_RETRY_SECONDS else DEFAULT_RETRY_SECONDS
+        )
         cooldown = settings.get("natural_cooldown")
         self.cooldown = cooldown if type(cooldown) is int and 0 <= cooldown <= 60 else 2
         calls = settings.get("natural_max_calls")
