@@ -158,6 +158,25 @@ def canonical_action(action: object) -> str:
         if value.endswith(suffix):
             return target
     return value
+
+
+RANK_WORDS = re.compile(r"排行|排名|榜单|榜")
+STRENGTH_WORDS = re.compile(r"强度|心法强|职业强")
+STRENGTH_VALUES = {"输出", "治疗", "组排", "单排", "全部", "dps", "DPS", "奶妈"}
+
+
+def correct_topic_action(action: str, args: list[str], text: str, hearts) -> tuple[str, list[str]]:
+    """按用户原话纠正模型选错的主题，例如把「气纯排行榜」误判成强度。"""
+    if action == "强度" and not STRENGTH_WORDS.search(text) and RANK_WORDS.search(text):
+        names = [value for value in args
+                 if value == "全部心法" or value in HEART_NAMES or alias_key(value) in hearts]
+        if names and len(names) == len(args):
+            return "排行", args
+    if action == "排行" and STRENGTH_WORDS.search(text) and not RANK_WORDS.search(text):
+        if args and all(value in STRENGTH_VALUES or value.endswith("+") or "-" in value
+                        for value in args):
+            return "强度", [STRENGTH_ARG_FIXES.get(value, value) for value in args]
+    return action, args
 MULTI_SEPARATOR = re.compile(r"和|以及|还有|顺便|、|,")
 MULTI_TOPICS = ("战绩", "复盘", "角色总览", "排行", "强度", "配置总览", "对位", "环境",
                 "配队", "分布", "每日走势", "门派", "技能", "阵法", "奇穴")
@@ -180,7 +199,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.78"
+PLUGIN_VERSION = "0.2.79"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -687,7 +706,7 @@ class BareCommand(filter.CustomFilter):
         return bare_command_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.78")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.79")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -1233,27 +1252,31 @@ class Mingjian(Star):
                 return
         QUERY_STATS["fail"] += 1
         LAST_STAGE[chat_key(event)] = ("查询失败", monotonic())
+        last_error = LAST_ERROR.get(chat_key(event))
+        timed_out = bool(last_error and last_error[0] == "TimeoutError")
         LAST_ERROR[chat_key(event)] = ("模型未完成", monotonic())
         response.result_chain = None
+        prefix = ("模型响应超时" if timed_out
+                  else "模型没有正确调用工具")
         if actions == ("强度",):
             response.completion_text = (
-                "模型没有在限定时间内完成心法强度查询，没有生成强度图。"
+                f"{prefix}，没有生成强度图。"
                 "可以直接发送「强度 输出」或「/剑三 强度 治疗」。"
             )
         elif actions == ("排行",):
             response.completion_text = (
-                "模型没有在限定时间内完成排行榜查询，没有生成榜单图。"
+                f"{prefix}，没有生成榜单图。"
                 "可以直接发送「排行 气纯」或「/剑三 排行」。"
             )
         elif actions == ("环境",):
             response.completion_text = (
-                "模型没有在限定时间内完成环境查询，没有生成环境图。"
+                f"{prefix}，没有生成环境图。"
                 "可以直接发送「环境 组排」或「/剑三 环境 单排」。"
             )
         else:
             command = ACTION_COMMANDS.get(actions[0], "/名剑帮助")
             response.completion_text = (
-                f"模型没有完成这次查询，没有生成图卡。"
+                f"{prefix}，没有生成图卡。"
                 f"可以直接发送「{actions[0]}」开头的指令、{command}，或再发一次。"
             )
 
@@ -1361,8 +1384,14 @@ class Mingjian(Star):
                 return
         if (not isinstance(action, str) or action not in QUERY_ACTIONS or not valid_chat_args(args)
                 or (action in {"名剑帮助", "名剑流程"} and args)):
-            yield "名剑查询参数无效，请按工具说明提供一个受支持的操作和参数数组。"
+            yield ("名剑查询参数无效。action 只能填："
+                   + "、".join(sorted(QUERY_ACTIONS))
+                   + "；args 按工具说明填写，无筛选填空数组。")
             return
+        corrected = correct_topic_action(action, list(args), text, self.aliases.hearts)
+        if corrected[0] != action:
+            logger.info(f"名剑按用户原话纠正主题 {action}->{corrected[0]} 参数={args}")
+            action, args = corrected
         used = int(event.get_extra(CHAT_TOOL_COUNT) or 0)
         if used >= self.natural.max_calls:
             yield f"本条消息最多查询 {self.natural.max_calls} 次。可让用户回复菜单编号或发起下一次查询。"
