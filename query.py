@@ -10,6 +10,11 @@ class QueryError(ValueError):
     pass
 
 
+SCORE_ARG = re.compile(
+    r"(?:[0-9]{3,4}\s*分?\s*(?:以上|\+|＋)|[0-9]{3,4}\s*[-–到]\s*[0-9]{3,4}\s*分?)"
+)
+
+
 @dataclass(frozen=True)
 class QueryTarget:
     action: str
@@ -237,6 +242,8 @@ def parse_ranking(
             continue
         key, sep, value = arg.replace("＝", "=").partition("=")
         if not sep:
+            if SCORE_ARG.fullmatch(arg):
+                raise QueryError("排行榜不支持按分数筛选。分数筛选请改用「强度 2400+」。")
             if PERIOD.fullmatch(arg):
                 key, value = "周期", arg
             elif arg.lower() in MODES:
@@ -257,6 +264,8 @@ def parse_ranking(
                 key, value = "周期", arg
             elif arg == "全部":
                 continue
+            elif re.fullmatch(r"[1-9][0-9]{3}", arg):
+                raise QueryError("排行榜不支持按分数筛选。分数筛选请改用「强度 2400+」。")
             elif re.fullmatch(r"[0-9]+", arg):
                 key, value = "页", arg
             elif re.fullmatch(r"top[0-9]+", arg, re.IGNORECASE):
@@ -337,6 +346,11 @@ def parse_strength(args: list[str]) -> Strength:
         elif not sep and (PERIOD.fullmatch(arg) or re.search(r"[0-9]{1,2}月[0-9]{1,2}日", arg)):
             key, value = "period", arg
         else:
+            if arg in HEART_NAMES or alias_key(arg) in HEART_NAMES:
+                raise QueryError(
+                    f"「{arg}」是单个心法，强度榜只按输出/治疗统计。"
+                    f"想看它的玩家排行，请发送「排行 {arg}」；想看分段强度，请发送「强度 2400+」。"
+                )
             raise QueryError(f"无法识别强度参数「{arg}」。")
         if key in values:
             raise QueryError("同一筛选项只能填写一次。")

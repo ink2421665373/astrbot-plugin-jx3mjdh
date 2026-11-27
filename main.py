@@ -163,6 +163,14 @@ def canonical_action(action: object) -> str:
 RANK_WORDS = re.compile(r"排行|排名|榜单|榜")
 STRENGTH_WORDS = re.compile(r"强度|心法强|职业强")
 STRENGTH_VALUES = {"输出", "治疗", "组排", "单排", "全部", "dps", "DPS", "奶妈"}
+SCORE_ARG = re.compile(
+    r"(?:[0-9]{3,4}\s*分?\s*(?:以上|\+|＋)|[0-9]{3,4}\s*[-–到]\s*[0-9]{3,4}\s*分?)"
+)
+
+
+def is_score_arg(value: str) -> bool:
+    """是否是分数筛选，例如 2400+、2400分以上、2200-2600。"""
+    return bool(SCORE_ARG.fullmatch(value.strip()))
 
 
 def correct_topic_action(action: str, args: list[str], text: str, hearts) -> tuple[str, list[str]]:
@@ -176,7 +184,14 @@ def correct_topic_action(action: str, args: list[str], text: str, hearts) -> tup
         if args and all(value in STRENGTH_VALUES or value.endswith("+") or "-" in value
                         for value in args):
             return "强度", [STRENGTH_ARG_FIXES.get(value, value) for value in args]
+    if action == "排行" and (score := text_score(text)):
+        # 玩家排行榜不支持按分数筛选，分数只有心法强度榜支持。
+        others = [value for value in args if not is_score_arg(value) and value != score]
+        if all(value in STRENGTH_VALUES for value in others):
+            return "强度", [score] + [STRENGTH_ARG_FIXES.get(value, value) for value in others]
     return action, args
+
+
 MULTI_SEPARATOR = re.compile(r"和|以及|还有|顺便|、|,")
 MULTI_TOPICS = ("战绩", "复盘", "角色总览", "排行", "强度", "配置总览", "对位", "环境",
                 "配队", "分布", "每日走势", "门派", "技能", "阵法", "奇穴")
@@ -199,7 +214,7 @@ DIGEST_TOOL_HINT = (
 )
 CHAT_DIGEST_USED = "astrbot_plugin_mingjian.chat_digest_used"
 CHAT_TOOL_COUNT = "astrbot_plugin_mingjian.chat_tool_count"
-PLUGIN_VERSION = "0.2.80"
+PLUGIN_VERSION = "0.2.81"
 QUERY_STATS = {"tool": 0, "retry": 0, "text": 0, "fail": 0}
 LAST_STAGE: dict[tuple[str, str, str], tuple[str, float]] = {}
 LAST_QUERY_AT: dict[tuple[str, str, str], float] = {}
@@ -235,6 +250,8 @@ ROLE_STRENGTH_TOOL_HINT = (
     "用户明确要查询心法强度榜时，请调用 mingjian_query，action 填强度。"
     "奶妈或治疗的 args 加入治疗；DPS 或输出的 args 加入输出。只保留用户明确给出的其他筛选。"
     "例如「查一下dps心法强度」调用 action=强度、args=[输出]。"
+    "「2400分以上的排行榜」「2400+的排行榜」也是分数筛选，用强度，args 填 2400+。"
+    "强度榜不按单个心法筛选，带心法的排行榜仍用排行。"
     "普通玩家名次榜使用排行。"
 )
 RANK_CHAT_TOPIC = re.compile(r"排行|榜单")
@@ -245,6 +262,8 @@ RANK_TOOL_HINT = (
     "用户明确要求查询名剑玩家排行榜或发送榜单图时，调用 mingjian_query，action 填排行。"
     "例如「帮我查剑三花间游的 3v3 排行榜，发榜单图」的 args 为 [\"花间游\",\"33\"]。"
     "梦江南、唯我独尊、唯满侠等是剑三服务器名，不是梗百科词条；「查一下梦江南的排行榜」的 args 为 [\"梦江南\"]。"
+    "排行榜不支持按分数筛选；用户说「2400分以上」「2400+」时改用 action=强度、args=[\"2400+\"]。"
+    "如果同时带心法和分数，不要猜参数，先用文字说明排行榜不支持分数筛选。"
     "图卡会由工具发送；只有工具返回后才可确认查询结果。"
 )
 BARE_RANK = re.compile(
@@ -706,7 +725,7 @@ class BareCommand(filter.CustomFilter):
         return bare_command_args(event) is not None
 
 
-@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.80")
+@register("astrbot_plugin_mingjian", "Codex", "剑网三名剑大会数据查询与图卡", "0.2.81")
 class Mingjian(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -1361,6 +1380,7 @@ class Mingjian(Star):
 
         日常聊天、打法建议或模糊评价走原生对话。例如「花间游怎么打苍云」不调用。「花间游最近强吗」先确认要数据还是打法。
         奶妈或治疗心法的强度榜是强度统计。对「查一下奶妈的心法强度排行」调用 action="强度"、args=["治疗"]。如果明确说 2200 分以上，参数填 "2200+"。普通玩家名次榜才用排行。
+        「2400分以上的排行榜」「2400+的排行榜」是分数筛选，调用 action="强度"、args=["2400+"]；玩家排行榜不支持分数筛选。
         DPS（也可写 dps）指输出。对「查一下dps心法强度」「dps强度排行」或「查一下输出心法强度排行」调用 action="强度"、args=["输出"]。
         「查一下本周组排PVP环境」调用 action="环境"、args=["组排"]。「本周」和「当前」是默认范围，可省略。
         「帮我查剑三花间游的 3v3 排行榜，发榜单图」调用 action="排行"、args=["花间游","33"]。图卡由工具发送。
@@ -1395,6 +1415,12 @@ class Mingjian(Star):
         if corrected[0] != action:
             logger.info(f"名剑按用户原话纠正主题 {action}->{corrected[0]} 参数={args}")
             action, args = corrected
+        if action == "排行" and (score := text_score(text)):
+            logger.info(f"名剑排行榜收到分数筛选 分数={score}")
+            yield (f"排行榜不支持按分数筛选，没有生成榜单图。"
+                   f"想看 {score} 的心法强度，可以直接发送「强度 {score}」；"
+                   f"想看玩家排行榜，请去掉分数条件。")
+            return
         used = int(event.get_extra(CHAT_TOOL_COUNT) or 0)
         if used >= self.natural.max_calls:
             yield f"本条消息最多查询 {self.natural.max_calls} 次。可让用户回复菜单编号或发起下一次查询。"
